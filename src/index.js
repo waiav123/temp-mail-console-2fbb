@@ -6,11 +6,16 @@ import { parse as parseDomain } from "tldts";
 const PAGE_SIZE = 20;
 const RULES_PAGE_SIZE = 12;
 const MAX_RANKED_URLS = 20;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const EMAIL_RETENTION_DAYS = 2;
+const DEFAULT_DEBUG_BODY_RETENTION_DAYS = 2;
 const SCHEMA_STATEMENTS = [
   "CREATE TABLE IF NOT EXISTS emails (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT NOT NULL, from_address TEXT NOT NULL, to_address TEXT NOT NULL, subject TEXT NOT NULL, extracted_json TEXT NOT NULL, received_at INTEGER NOT NULL)",
   "CREATE INDEX IF NOT EXISTS idx_emails_received_at ON emails (received_at DESC)",
   "CREATE TABLE IF NOT EXISTS rules (id INTEGER PRIMARY KEY AUTOINCREMENT, remark TEXT, sender_filter TEXT, pattern TEXT NOT NULL, created_at INTEGER NOT NULL)",
-  "CREATE TABLE IF NOT EXISTS whitelist (id INTEGER PRIMARY KEY AUTOINCREMENT, sender_pattern TEXT NOT NULL, created_at INTEGER NOT NULL)"
+  "CREATE TABLE IF NOT EXISTS whitelist (id INTEGER PRIMARY KEY AUTOINCREMENT, sender_pattern TEXT NOT NULL, created_at INTEGER NOT NULL)",
+  "CREATE TABLE IF NOT EXISTS email_debug_bodies (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT NOT NULL UNIQUE, from_address TEXT NOT NULL, to_address TEXT NOT NULL, subject TEXT NOT NULL, text_content TEXT, html_content TEXT, normalized_text TEXT NOT NULL, ranked_urls_json TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)",
+  "CREATE INDEX IF NOT EXISTS idx_email_debug_bodies_expires_at ON email_debug_bodies (expires_at)"
 ];
 
 const THEME_STORAGE_KEY = "temp-mail-theme";
@@ -57,6 +62,7 @@ export default {
   async email(message, env, ctx) {
     await ensureSchema(env.DB);
     const now = Date.now();
+    const messageId = crypto.randomUUID();
     const parsed = await parseIncomingEmail(message);
 
     // 发信人白名单检查：白名单非空时，不匹配则直接忽略
@@ -64,23 +70,29 @@ export default {
     if (!senderInWhitelist(parsed.from, whitelist)) return;
 
     const rules = await loadRules(env.DB);
-    const content = buildExtractionContent(parsed);
-    const matches = applyRules(content, parsed.from, rules);
+    const extraction = buildExtractionContent(parsed);
+    const matches = applyRules(extraction.content, parsed.from, rules);
+    const pendingWrites = [
+      saveEmailRecord(env.DB, {
+        messageId,
+        fromAddress: parsed.from,
+        toAddress: parsed.to.join(","),
+        subject: parsed.subject,
+        matches,
+        receivedAt: now
+      })
+    ];
+    const debugBodyRecord = buildDebugBodyRecord({
+      messageId,
+      parsed,
+      extraction,
+      createdAt: now,
+      retentionDays: getDebugBodyRetentionDays(env)
+    });
 
-    ctx.waitUntil(
-      env.DB.prepare(
-        "INSERT INTO emails (message_id, from_address, to_address, subject, extracted_json, received_at) VALUES (?, ?, ?, ?, ?, ?)"
-      )
-        .bind(
-          crypto.randomUUID(),
-          parsed.from,
-          parsed.to.join(","),
-          parsed.subject,
-          JSON.stringify(matches),
-          now
-        )
-        .run()
-    );
+    if (debugBodyRecord) pendingWrites.push(saveDebugBody(env.DB, debugBodyRecord));
+
+    ctx.waitUntil(Promise.all(pendingWrites));
 
     // [新增配置] 可选的全局邮件转发功能
     if (env.FORWARD_TO) {
@@ -121,6 +133,7 @@ export default {
       }
       await ensureSchema(env.DB);
       if (pathname === "/admin/emails" && method === "GET") return handleAdminEmails(url, env);
+      if (pathname.startsWith("/admin/emails/") && pathname.endsWith("/body") && method === "GET") return handleAdminEmailBody(pathname, env);
       if (pathname === "/admin/rules" && method === "GET") return handleAdminRulesGet(url, env);
       if (pathname === "/admin/rules" && method === "POST") return handleAdminRulesPost(request, env);
       if (pathname.startsWith("/admin/rules/") && method === "DELETE") return handleAdminRulesDelete(pathname, env);
@@ -134,17 +147,21 @@ export default {
 
   async scheduled(event, env, ctx) {
     await ensureSchema(env.DB);
-    // 定时器触发：清理超过 48 小时的邮件数据
-    // 48 hours = 48 * 60 * 60 * 1000 = 172800000 毫秒
-    const expirationTime = Date.now() - 172800000;
+    const now = Date.now();
+    const emailExpirationTime = now - getEmailRetentionMs(env);
 
-    ctx.waitUntil(
+    ctx.waitUntil(Promise.all([
       env.DB.prepare("DELETE FROM emails WHERE received_at < ?")
-        .bind(expirationTime)
+        .bind(emailExpirationTime)
         .run()
-        .then(result => console.log(`[Cron] 自动清理完毕: 删除期限 < ${expirationTime}`))
-        .catch(err => console.error("[Cron] 自动清理失败:", err))
-    );
+        .then(() => console.log(`[Cron] email cleanup finished: received_at < ${emailExpirationTime}`))
+        .catch(err => console.error("[Cron] email cleanup failed:", err)),
+      env.DB.prepare("DELETE FROM email_debug_bodies WHERE expires_at <= ?")
+        .bind(now)
+        .run()
+        .then(() => console.log(`[Cron] debug body cleanup finished: expires_at <= ${now}`))
+        .catch(err => console.error("[Cron] debug body cleanup failed:", err))
+    ]));
   }
 };
 
@@ -180,7 +197,41 @@ async function handleAdminEmails(url, env) {
     env.DB.prepare("SELECT COUNT(1) as total FROM emails").first()
   ]);
 
-  return json({ page, pageSize: PAGE_SIZE, total: countRow?.total || 0, items: list.results });
+  return json({
+    page,
+    pageSize: PAGE_SIZE,
+    total: countRow?.total || 0,
+    items: list.results,
+    debugBodyRetentionDays: getDebugBodyRetentionDays(env)
+  });
+}
+
+async function handleAdminEmailBody(pathname, env) {
+  const prefix = "/admin/emails/";
+  const suffix = "/body";
+  const rawMessageId = pathname.slice(prefix.length, -suffix.length);
+  const messageId = decodeURIComponent(rawMessageId || "").trim();
+  if (!messageId) return jsonError("invalid message id", 400);
+
+  const row = await env.DB.prepare(
+    "SELECT message_id, from_address, to_address, subject, text_content, html_content, normalized_text, ranked_urls_json, created_at, expires_at FROM email_debug_bodies WHERE message_id = ? LIMIT 1"
+  ).bind(messageId).first();
+
+  if (!row) return jsonError("debug body not found or expired", 404);
+
+  const rankedUrls = safeParseJson(row.ranked_urls_json);
+  return json({
+    message_id: row.message_id,
+    from_address: row.from_address,
+    to_address: row.to_address,
+    subject: row.subject,
+    text_content: row.text_content || "",
+    html_content: row.html_content || "",
+    normalized_text: row.normalized_text || "",
+    ranked_urls: Array.isArray(rankedUrls) ? rankedUrls : [],
+    created_at: row.created_at,
+    expires_at: row.expires_at
+  });
 }
 
 async function handleAdminRulesGet(url, env) {
@@ -271,10 +322,11 @@ function buildExtractionContent(parsed) {
   const subject = normalizeText(parsed.subject);
   const normalizedText = buildNormalizedText(parsed);
   const rankedUrls = buildRankedUrls(parsed, normalizedText);
-
-  return [subject, normalizedText, rankedUrls.join("\n")]
+  const content = [subject, normalizedText, rankedUrls.join("\n")]
     .filter(Boolean)
     .join("\n\n");
+
+  return { subject, normalizedText, rankedUrls, content };
 }
 
 function buildNormalizedText(parsed) {
@@ -317,6 +369,63 @@ function buildRankedUrls(parsed, normalizedText) {
     })
     .slice(0, MAX_RANKED_URLS)
     .map(([url]) => url);
+}
+
+function buildDebugBodyRecord({ messageId, parsed, extraction, createdAt, retentionDays }) {
+  if (!retentionDays) return null;
+
+  return {
+    messageId,
+    fromAddress: parsed.from,
+    toAddress: parsed.to.join(","),
+    subject: parsed.subject,
+    textContent: parsed.text,
+    htmlContent: parsed.html,
+    normalizedText: extraction.normalizedText,
+    rankedUrlsJson: JSON.stringify(extraction.rankedUrls),
+    createdAt,
+    expiresAt: createdAt + retentionDays * DAY_MS
+  };
+}
+
+async function saveEmailRecord(db, { messageId, fromAddress, toAddress, subject, matches, receivedAt }) {
+  await db.prepare(
+    "INSERT INTO emails (message_id, from_address, to_address, subject, extracted_json, received_at) VALUES (?, ?, ?, ?, ?, ?)"
+  )
+    .bind(messageId, fromAddress, toAddress, subject, JSON.stringify(matches), receivedAt)
+    .run();
+}
+
+async function saveDebugBody(db, record) {
+  await db.prepare(
+    "INSERT INTO email_debug_bodies (message_id, from_address, to_address, subject, text_content, html_content, normalized_text, ranked_urls_json, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  )
+    .bind(
+      record.messageId,
+      record.fromAddress,
+      record.toAddress,
+      record.subject,
+      record.textContent,
+      record.htmlContent,
+      record.normalizedText,
+      record.rankedUrlsJson,
+      record.createdAt,
+      record.expiresAt
+    )
+    .run();
+}
+
+function getDebugBodyRetentionDays(env) {
+  const rawValue = String(env.DEBUG_BODY_RETENTION_DAYS || "").trim();
+  if (!rawValue) return DEFAULT_DEBUG_BODY_RETENTION_DAYS;
+
+  const parsed = Number(rawValue);
+  if (!Number.isFinite(parsed)) return DEFAULT_DEBUG_BODY_RETENTION_DAYS;
+  return Math.max(0, Math.floor(parsed));
+}
+
+function getEmailRetentionMs(env) {
+  return Math.max(EMAIL_RETENTION_DAYS, getDebugBodyRetentionDays(env)) * DAY_MS;
 }
 
 function safeExtractUrls(value) {
@@ -875,6 +984,7 @@ function renderHtml() {
           <div class="p-5 border-b border-white/5 flex items-center justify-between bg-white/[0.01]">
             <div>
               <h2 class="text-sm font-semibold text-white">收件箱</h2>
+              <p class="text-[11px] text-slate-400 mt-0.5">调试正文{{ debugBodyRetentionDays > 0 ? '仅保留最近 ' + debugBodyRetentionDays + ' 天' : '已关闭保存' }}，用于排查正则命中问题</p>
             </div>
             <div class="flex items-center gap-2 text-[11px]">
               <button class="px-2.5 py-1.5 rounded-lg border border-white/5 hover:bg-white/5 transition-colors disabled:opacity-50 disabled:cursor-not-allowed" @click="prevPage" :disabled="page===1">PREV</button>
@@ -898,7 +1008,7 @@ function renderHtml() {
                 <div class="min-w-0 text-[11px] text-slate-400 truncate">{{ item.from_address }}</div>
                 <div class="min-w-0 text-[11px] text-slate-400 truncate">{{ item.to_address }}</div>
                 <div class="text-[11px] text-slate-400 text-right tabular-nums">{{ formatTime(item.received_at) }}</div>
-                <div v-if="!hasResult(item.extracted_json) || expandedResults[item.message_id]" class="col-span-4 mt-3">
+                <div v-if="!hasResult(item.extracted_json) || expandedResults[item.message_id]" class="col-span-4 mt-3 space-y-3">
                   <div v-if="hasResult(item.extracted_json) && expandedResults[item.message_id]" class="relative group/copy" @click.stop>
                     <div
                       class="text-[12px] bg-indigo-500/10 border border-indigo-500/20 text-indigo-200 rounded-lg p-3 whitespace-pre-wrap font-mono pr-12"
@@ -909,6 +1019,13 @@ function renderHtml() {
                     >{{ copyStatus[item.message_id] ? 'Copied' : 'Copy' }}</button>
                   </div>
                   <div v-if="!hasResult(item.extracted_json)" class="text-[11px] text-slate-600">— 未提取到规则内容</div>
+                  <div class="flex items-center justify-between gap-3" @click.stop>
+                    <div class="text-[10px] text-slate-500">查看归一化文本、原始文本、HTML 与 URL 排序结果，专门用于规则调试</div>
+                    <button
+                      class="shrink-0 px-2.5 py-1.5 rounded-lg border border-white/10 text-[11px] text-slate-300 hover:text-white hover:bg-white/5 transition-colors"
+                      @click.stop="openDebugBody(item)"
+                    >查看调试正文</button>
+                  </div>
                 </div>
               </div>
             </div>
@@ -1056,6 +1173,67 @@ data.results: 命中结果对象序列 [{ rule_id: 1, value: "123", remark: "备
             </div>
           </div>
         </section>
+
+        <div v-if="debugBodyModalOpen" class="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm p-4 sm:p-6" @click.self="closeDebugBody">
+          <div class="max-w-4xl mx-auto mt-6 bg-[#030303] border border-white/10 rounded-2xl shadow-2xl overflow-hidden">
+            <div class="px-5 py-4 border-b border-white/10 flex items-start justify-between gap-4">
+              <div class="min-w-0">
+                <div class="text-[11px] font-medium text-slate-500 uppercase tracking-widest">Debug Body</div>
+                <div class="text-sm font-semibold text-white truncate mt-1">{{ debugBodyTarget?.subject || '(无主题)' }}</div>
+                <div class="text-[11px] text-slate-400 mt-1 break-all">{{ debugBodyTarget?.from_address || '—' }} → {{ debugBodyTarget?.to_address || '—' }}</div>
+              </div>
+              <button class="shrink-0 px-3 py-1.5 rounded-lg border border-white/10 text-[11px] text-slate-400 hover:text-white hover:bg-white/5 transition-colors" @click="closeDebugBody">Close</button>
+            </div>
+            <div class="p-5 max-h-[75vh] overflow-y-auto space-y-4">
+              <div v-if="debugBodyLoading" class="text-[12px] text-slate-400">正在加载调试正文...</div>
+              <div v-else-if="debugBodyError" class="rounded-xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-[12px] text-red-300">{{ debugBodyError }}</div>
+              <template v-else-if="debugBodyData">
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div class="rounded-xl border border-white/5 bg-white/[0.02] p-3">
+                    <div class="text-[10px] text-slate-500 uppercase tracking-widest">Saved</div>
+                    <div class="text-[12px] text-slate-200 mt-1">{{ formatTime(debugBodyData.created_at) }}</div>
+                  </div>
+                  <div class="rounded-xl border border-white/5 bg-white/[0.02] p-3">
+                    <div class="text-[10px] text-slate-500 uppercase tracking-widest">Expires</div>
+                    <div class="text-[12px] text-slate-200 mt-1">{{ formatTime(debugBodyData.expires_at) }}</div>
+                  </div>
+                </div>
+
+                <div class="space-y-2">
+                  <div class="flex items-center justify-between gap-2">
+                    <div class="text-[11px] font-medium text-slate-400 uppercase tracking-widest">Normalized Text</div>
+                    <button class="px-2 py-1 rounded-md border border-white/10 text-[10px] text-slate-400 hover:text-white hover:bg-white/5 transition-colors" @click="copyContent(debugBodyData.normalized_text || '', 'debug-normalized-' + debugBodyData.message_id)">{{ copyStatus['debug-normalized-' + debugBodyData.message_id] ? 'Copied' : 'Copy' }}</button>
+                  </div>
+                  <pre class="rounded-xl border border-white/5 bg-white/[0.02] p-3 text-[12px] text-slate-200 whitespace-pre-wrap break-words font-mono">{{ debugBodyData.normalized_text || '—' }}</pre>
+                </div>
+
+                <div class="space-y-2">
+                  <div class="flex items-center justify-between gap-2">
+                    <div class="text-[11px] font-medium text-slate-400 uppercase tracking-widest">Ranked URLs</div>
+                    <button class="px-2 py-1 rounded-md border border-white/10 text-[10px] text-slate-400 hover:text-white hover:bg-white/5 transition-colors" @click="copyContent(formatDebugUrls(debugBodyData.ranked_urls), 'debug-urls-' + debugBodyData.message_id)">{{ copyStatus['debug-urls-' + debugBodyData.message_id] ? 'Copied' : 'Copy' }}</button>
+                  </div>
+                  <pre class="rounded-xl border border-white/5 bg-white/[0.02] p-3 text-[12px] text-slate-200 whitespace-pre-wrap break-words font-mono">{{ formatDebugUrls(debugBodyData.ranked_urls) }}</pre>
+                </div>
+
+                <div class="space-y-2">
+                  <div class="flex items-center justify-between gap-2">
+                    <div class="text-[11px] font-medium text-slate-400 uppercase tracking-widest">Text Content</div>
+                    <button class="px-2 py-1 rounded-md border border-white/10 text-[10px] text-slate-400 hover:text-white hover:bg-white/5 transition-colors" @click="copyContent(debugBodyData.text_content || '', 'debug-text-' + debugBodyData.message_id)">{{ copyStatus['debug-text-' + debugBodyData.message_id] ? 'Copied' : 'Copy' }}</button>
+                  </div>
+                  <pre class="rounded-xl border border-white/5 bg-white/[0.02] p-3 text-[12px] text-slate-200 whitespace-pre-wrap break-words font-mono">{{ debugBodyData.text_content || '—' }}</pre>
+                </div>
+
+                <div class="space-y-2">
+                  <div class="flex items-center justify-between gap-2">
+                    <div class="text-[11px] font-medium text-slate-400 uppercase tracking-widest">HTML Content</div>
+                    <button class="px-2 py-1 rounded-md border border-white/10 text-[10px] text-slate-400 hover:text-white hover:bg-white/5 transition-colors" @click="copyContent(debugBodyData.html_content || '', 'debug-html-' + debugBodyData.message_id)">{{ copyStatus['debug-html-' + debugBodyData.message_id] ? 'Copied' : 'Copy' }}</button>
+                  </div>
+                  <pre class="rounded-xl border border-white/5 bg-white/[0.02] p-3 text-[12px] text-slate-200 whitespace-pre-wrap break-words font-mono">{{ debugBodyData.html_content || '—' }}</pre>
+                </div>
+              </template>
+            </div>
+          </div>
+        </div>
       </main>
       <footer class="max-w-5xl mx-auto px-4 py-6 text-xs text-slate-400">
         <div class="flex items-center justify-between border-t border-white/10 pt-4">
@@ -1100,6 +1278,7 @@ data.results: 命中结果对象序列 [{ rule_id: 1, value: "123", remark: "备
             rules: [],
             rulesPage: 1,
             rulesTotal: 0,
+            debugBodyRetentionDays: 0,
             newRule: { remark: "", sender_filter: "", pattern: "" },
             whitelistItems: [],
             whitelistPage: 1,
@@ -1110,7 +1289,12 @@ data.results: 命中结果对象序列 [{ rule_id: 1, value: "123", remark: "备
             adminError: "",
             poller: null,
             expandedResults: {},
-            copyStatus: {}
+            copyStatus: {},
+            debugBodyModalOpen: false,
+            debugBodyTarget: null,
+            debugBodyData: null,
+            debugBodyLoading: false,
+            debugBodyError: ""
           };
         },
         computed: {
@@ -1169,6 +1353,7 @@ data.results: 命中结果对象序列 [{ rule_id: 1, value: "123", remark: "备
             const data = payload.data || {};
             this.items = data.items || [];
             this.total = data.total || 0;
+            this.debugBodyRetentionDays = Number(data.debugBodyRetentionDays || 0);
           },
           async loadRules() {
             const payload = await this.requestJson("/admin/rules?page=" + this.rulesPage);
@@ -1246,6 +1431,40 @@ data.results: 命中结果对象序列 [{ rule_id: 1, value: "123", remark: "备
           toggleResult(messageId) {
             this.expandedResults[messageId] = !this.expandedResults[messageId];
           },
+          async openDebugBody(item) {
+            this.debugBodyTarget = item;
+            this.debugBodyData = null;
+            this.debugBodyError = "";
+            this.debugBodyLoading = true;
+            this.debugBodyModalOpen = true;
+
+            try {
+              const res = await fetch("/admin/emails/" + encodeURIComponent(item.message_id) + "/body", {
+                headers: this.adminHeaders()
+              });
+              if (await this.handleAuthError(res)) return;
+
+              const payload = await res.json().catch(() => null);
+              if (!res.ok) {
+                this.debugBodyError = payload?.message || "调试正文未保存或已过期";
+                return;
+              }
+
+              this.debugBodyData = payload?.data || null;
+            } catch (err) {
+              console.error("Failed to load debug body:", err);
+              this.debugBodyError = "加载调试正文失败";
+            } finally {
+              this.debugBodyLoading = false;
+            }
+          },
+          closeDebugBody() {
+            this.debugBodyModalOpen = false;
+            this.debugBodyTarget = null;
+            this.debugBodyData = null;
+            this.debugBodyLoading = false;
+            this.debugBodyError = "";
+          },
           async copyContent(text, messageId) {
             try {
               await navigator.clipboard.writeText(text);
@@ -1269,6 +1488,9 @@ data.results: 命中结果对象序列 [{ rule_id: 1, value: "123", remark: "备
               }
               return String(parsed ?? "");
             } catch { return raw || ""; }
+          },
+          formatDebugUrls(urls) {
+            return Array.isArray(urls) && urls.length > 0 ? urls.join("\\n") : "—";
           },
           formatTime(ts) {
             return new Date(ts).toLocaleString();
