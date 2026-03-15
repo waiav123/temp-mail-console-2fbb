@@ -9,7 +9,10 @@
     "build": "wrangler build"
   },
   "dependencies": {
-    "postal-mime": "^2.4.2"
+    "get-urls": "^12.1.0",
+    "html-to-text": "^9.0.5",
+    "postal-mime": "^2.4.2",
+    "tldts": "^7.0.25"
   },
   "devDependencies": {
     "wrangler": "^4.72.0"

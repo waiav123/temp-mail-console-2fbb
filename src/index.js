@@ -1,13 +1,53 @@
 import PostalMime from "postal-mime";
+import getUrls from "get-urls";
+import { compile } from "html-to-text";
+import { parse as parseDomain } from "tldts";
 
 const PAGE_SIZE = 20;
 const RULES_PAGE_SIZE = 12;
+const MAX_RANKED_URLS = 20;
 const SCHEMA_STATEMENTS = [
   "CREATE TABLE IF NOT EXISTS emails (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT NOT NULL, from_address TEXT NOT NULL, to_address TEXT NOT NULL, subject TEXT NOT NULL, extracted_json TEXT NOT NULL, received_at INTEGER NOT NULL)",
   "CREATE INDEX IF NOT EXISTS idx_emails_received_at ON emails (received_at DESC)",
   "CREATE TABLE IF NOT EXISTS rules (id INTEGER PRIMARY KEY AUTOINCREMENT, remark TEXT, sender_filter TEXT, pattern TEXT NOT NULL, created_at INTEGER NOT NULL)",
   "CREATE TABLE IF NOT EXISTS whitelist (id INTEGER PRIMARY KEY AUTOINCREMENT, sender_pattern TEXT NOT NULL, created_at INTEGER NOT NULL)"
 ];
+
+const THEME_STORAGE_KEY = "temp-mail-theme";
+const URL_PRIORITY_HINTS = [
+  /verify/i,
+  /verification/i,
+  /confirm/i,
+  /activate/i,
+  /login/i,
+  /sign-?in/i,
+  /auth/i,
+  /magic/i,
+  /token/i,
+  /code/i,
+  /reset/i,
+  /password/i,
+  /invite/i
+];
+const URL_NOISE_HINTS = [
+  /unsubscribe/i,
+  /preferences/i,
+  /privacy/i,
+  /terms/i,
+  /support/i,
+  /help/i,
+  /status/i,
+  /tracking/i,
+  /pixel/i,
+  /\.(?:png|jpe?g|gif|svg|webp|ico|css|js)(?:[?#]|$)/i
+];
+const htmlToText = compile({
+  wordwrap: false,
+  selectors: [
+    { selector: "a", options: { ignoreHref: true } },
+    { selector: "img", format: "skip" }
+  ]
+});
 
 let schemaReadyPromise = null;
 
@@ -24,7 +64,7 @@ export default {
     if (!senderInWhitelist(parsed.from, whitelist)) return;
 
     const rules = await loadRules(env.DB);
-    const content = parsed.text || parsed.html || "";
+    const content = buildExtractionContent(parsed);
     const matches = applyRules(content, parsed.from, rules);
 
     ctx.waitUntil(
@@ -227,6 +267,135 @@ async function parseIncomingEmail(message) {
   };
 }
 
+function buildExtractionContent(parsed) {
+  const subject = normalizeText(parsed.subject);
+  const normalizedText = buildNormalizedText(parsed);
+  const rankedUrls = buildRankedUrls(parsed, normalizedText);
+
+  return [subject, normalizedText, rankedUrls.join("\n")]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function buildNormalizedText(parsed) {
+  const sections = [];
+  appendUniqueText(sections, normalizeText(parsed.text));
+  appendUniqueText(sections, normalizeHtmlText(parsed.html));
+  return stripDetectedUrls(sections.join("\n\n"));
+}
+
+function normalizeHtmlText(html) {
+  const source = String(html || "").trim();
+  if (!source) return "";
+
+  try {
+    return normalizeText(htmlToText(source));
+  } catch (error) {
+    console.error("HTML 转文本失败:", error);
+    return normalizeText(source.replace(/<[^>]+>/g, " "));
+  }
+}
+
+function buildRankedUrls(parsed, normalizedText) {
+  const senderContext = getSenderContext(parsed.from);
+  const candidates = new Map();
+
+  for (const source of [parsed.subject, parsed.text, parsed.html, normalizedText]) {
+    for (const url of safeExtractUrls(source)) {
+      const score = scoreUrl(url, senderContext);
+      const previousScore = candidates.get(url);
+      if (previousScore === undefined || score > previousScore) {
+        candidates.set(url, score);
+      }
+    }
+  }
+
+  return [...candidates.entries()]
+    .sort((left, right) => {
+      if (right[1] !== left[1]) return right[1] - left[1];
+      return left[0].length - right[0].length;
+    })
+    .slice(0, MAX_RANKED_URLS)
+    .map(([url]) => url);
+}
+
+function safeExtractUrls(value) {
+  const source = String(value || "").trim();
+  if (!source) return [];
+
+  try {
+    return [...getUrls(source)];
+  } catch (error) {
+    console.error("URL 提取失败:", error);
+    return [];
+  }
+}
+
+function stripDetectedUrls(value) {
+  let output = String(value || "");
+  for (const url of safeExtractUrls(output)) {
+    output = output.split(url).join(" ");
+  }
+  return normalizeText(output);
+}
+
+function appendUniqueText(target, value) {
+  if (!value || target.includes(value)) return;
+  target.push(value);
+}
+
+function normalizeText(value) {
+  return String(value || "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/\u00A0/g, " ")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n[ \t]+/g, "\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function getSenderContext(sender) {
+  const senderValue = String(sender || "").trim().toLowerCase();
+  const atIndex = senderValue.lastIndexOf("@");
+  const host = atIndex === -1 ? "" : senderValue.slice(atIndex + 1);
+  const parsed = host ? parseDomain(host) : null;
+
+  return {
+    host,
+    domain: String(parsed?.domain || "").toLowerCase()
+  };
+}
+
+function scoreUrl(url, senderContext) {
+  let score = 0;
+  let hostname = "";
+  let domain = "";
+
+  try {
+    const parsed = parseDomain(url);
+    hostname = String(parsed.hostname || "").toLowerCase();
+    domain = String(parsed.domain || "").toLowerCase();
+  } catch {}
+
+  if (/^https:\/\//i.test(url)) score += 10;
+  if (URL_PRIORITY_HINTS.some((pattern) => pattern.test(url))) score += 25;
+  if (URL_NOISE_HINTS.some((pattern) => pattern.test(url))) score -= 35;
+
+  if (senderContext.host && hostname) {
+    if (hostname === senderContext.host) score += 120;
+    else if (hostname.endsWith(`.${senderContext.host}`)) score += 90;
+  }
+
+  if (senderContext.domain && domain) {
+    if (domain === senderContext.domain) score += 100;
+    else if (hostname.endsWith(`.${senderContext.domain}`)) score += 80;
+  }
+
+  return score;
+}
+
 async function loadWhitelist(db) {
   const result = await db.prepare("SELECT id, sender_pattern FROM whitelist ORDER BY created_at DESC").all();
   return result.results.map((row) => ({
@@ -359,6 +528,188 @@ function jsonError(message, status) {
 
 // ─── HTML Rendering ───────────────────────────────────────────────────────────
 
+function renderThemeBootScript() {
+  return `<script>
+    (() => {
+      let theme = "light";
+      try {
+        const stored = localStorage.getItem("${THEME_STORAGE_KEY}");
+        if (stored === "dark" || stored === "light") theme = stored;
+      } catch {}
+      document.documentElement.dataset.theme = theme;
+    })();
+  </script>`;
+}
+
+function renderThemeStyles() {
+  return `
+      :root {
+        color-scheme: light;
+        --light-bg: #f5efe7;
+        --light-bg-accent: rgba(99, 102, 241, 0.16);
+        --light-bg-accent-secondary: rgba(14, 165, 233, 0.14);
+        --light-panel: rgba(255, 255, 255, 0.8);
+        --light-panel-muted: rgba(255, 255, 255, 0.66);
+        --light-panel-strong: rgba(255, 255, 255, 0.94);
+        --light-border: rgba(148, 163, 184, 0.28);
+        --light-text: #0f172a;
+        --light-muted: #64748b;
+        --light-faint: #94a3b8;
+        --light-accent: #4338ca;
+      }
+
+      html[data-theme="light"] {
+        color-scheme: light;
+      }
+
+      html[data-theme="dark"] {
+        color-scheme: dark;
+      }
+
+      body {
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        transition: background 0.28s ease, color 0.2s ease;
+      }
+
+      html[data-theme="light"] body {
+        background:
+          radial-gradient(circle at top center, var(--light-bg-accent), transparent 46%),
+          radial-gradient(circle at bottom left, var(--light-bg-accent-secondary), transparent 38%),
+          var(--light-bg) !important;
+        color: var(--light-text) !important;
+      }
+
+      html[data-theme="dark"] body {
+        background: #09090b !important;
+      }
+
+      html[data-theme="light"] .bg-white\\/\\[0\\.01\\] {
+        background-color: var(--light-panel-muted) !important;
+      }
+
+      html[data-theme="light"] .bg-white\\/\\[0\\.02\\],
+      html[data-theme="light"] .backdrop-blur-xl,
+      html[data-theme="light"] .backdrop-blur-sm {
+        background-color: var(--light-panel) !important;
+      }
+
+      html[data-theme="light"] .bg-white\\/\\[0\\.03\\],
+      html[data-theme="light"] .bg-white\\/\\[0\\.05\\] {
+        background-color: rgba(255, 255, 255, 0.7) !important;
+      }
+
+      html[data-theme="light"] .bg-white\\/\\[0\\.04\\],
+      html[data-theme="light"] .bg-white\\/\\[0\\.1\\] {
+        background-color: var(--light-panel-strong) !important;
+      }
+
+      html[data-theme="light"] .bg-black\\/20,
+      html[data-theme="light"] .bg-\\[\\#030303\\] {
+        background-color: rgba(255, 255, 255, 0.92) !important;
+      }
+
+      html[data-theme="light"] .border-white\\/5,
+      html[data-theme="light"] .border-white\\/10 {
+        border-color: var(--light-border) !important;
+      }
+
+      html[data-theme="light"] .ring-white\\/10 {
+        --tw-ring-color: rgba(148, 163, 184, 0.3) !important;
+      }
+
+      html[data-theme="light"] .text-white,
+      html[data-theme="light"] .text-slate-200,
+      html[data-theme="light"] .text-slate-300 {
+        color: var(--light-text) !important;
+      }
+
+      html[data-theme="light"] .text-slate-400,
+      html[data-theme="light"] .text-slate-500 {
+        color: var(--light-muted) !important;
+      }
+
+      html[data-theme="light"] .text-slate-600 {
+        color: var(--light-faint) !important;
+      }
+
+      html[data-theme="light"] .text-indigo-200,
+      html[data-theme="light"] .text-indigo-300 {
+        color: var(--light-accent) !important;
+      }
+
+      html[data-theme="light"] .bg-indigo-500\\/10 {
+        background-color: rgba(99, 102, 241, 0.08) !important;
+      }
+
+      html[data-theme="light"] .border-indigo-500\\/20,
+      html[data-theme="light"] .hover\\:border-indigo-500\\/30:hover {
+        border-color: rgba(99, 102, 241, 0.22) !important;
+      }
+
+      html[data-theme="light"] .hover\\:bg-white\\/5:hover,
+      html[data-theme="light"] .hover\\:bg-white\\/\\[0\\.04\\]:hover {
+        background-color: var(--light-panel-strong) !important;
+      }
+
+      html[data-theme="light"] .hover\\:text-white:hover,
+      html[data-theme="light"] .hover\\:text-slate-200:hover,
+      html[data-theme="light"] .hover\\:text-slate-100:hover {
+        color: var(--light-text) !important;
+      }
+
+      html[data-theme="light"] .bg-white.text-slate-900 {
+        background-color: var(--light-text) !important;
+        color: #f8fafc !important;
+      }
+
+      html[data-theme="light"] .hover\\:bg-slate-200:hover {
+        background-color: #1e293b !important;
+        color: #f8fafc !important;
+      }
+
+      html[data-theme="light"] .shadow-2xl,
+      html[data-theme="light"] .shadow-xl {
+        box-shadow: 0 18px 45px rgba(148, 163, 184, 0.18) !important;
+      }
+
+      html[data-theme="light"] .shadow-black\\/20,
+      html[data-theme="light"] .shadow-white\\/5 {
+        --tw-shadow-color: rgba(148, 163, 184, 0.18) !important;
+      }
+
+      .theme-toggle {
+        backdrop-filter: blur(12px);
+        transition: all 0.2s ease;
+      }
+
+      html[data-theme="light"] .theme-toggle {
+        background: rgba(255, 255, 255, 0.7);
+        color: var(--light-muted);
+        border: 1px solid var(--light-border);
+      }
+
+      html[data-theme="dark"] .theme-toggle {
+        background: rgba(255, 255, 255, 0.05);
+        color: #94a3b8;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+      }
+
+      .theme-toggle:hover {
+        transform: translateY(-1px);
+      }
+
+      html[data-theme="light"] .theme-toggle:hover {
+        background: rgba(255, 255, 255, 0.94);
+        color: var(--light-text);
+      }
+
+      html[data-theme="dark"] .theme-toggle:hover {
+        background: rgba(255, 255, 255, 0.1);
+        color: #ffffff;
+      }
+    `;
+}
+
 function renderAuthHtml() {
   return `<!DOCTYPE html>
 <html lang="zh">
@@ -367,16 +718,20 @@ function renderAuthHtml() {
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Temp Mail Console - Login</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <style>body { font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }</style>
+    ${renderThemeBootScript()}
+    <style>${renderThemeStyles()}</style>
   </head>
   <body class="bg-[#09090b] text-slate-200 antialiased flex items-center justify-center min-h-screen selection:bg-indigo-500/30">
+    <div class="absolute right-4 top-4 sm:right-6 sm:top-6">
+      <button id="theme-toggle" type="button" class="theme-toggle rounded-xl px-3 py-2 text-[12px] font-medium">暗色模式</button>
+    </div>
     <div class="absolute inset-0 bg-[radial-gradient(circle_at_top_center,rgba(99,102,241,0.08),transparent_50%)] pointer-events-none"></div>
     <div class="w-full max-w-sm p-8 rounded-[1.5rem] bg-white/[0.02] border border-white/5 backdrop-blur-xl shadow-2xl relative">
       <div class="w-12 h-12 mb-6 flex border border-white/10 items-center justify-center rounded-2xl bg-gradient-to-br from-indigo-500 to-purple-600 shadow-inner shadow-white/20">
         <svg class="w-6 h-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
       </div>
       <h1 class="text-xl font-semibold text-white tracking-tight mb-1">Console Access</h1>
-      <p class="text-[13px] text-slate-400 mb-8">Enter your token to continue</p>
+      <p class="text-[13px] text-slate-400 mb-8">Light by default, dark mode on demand.</p>
       <form class="space-y-4" onsubmit="return false;">
         <input
           id="admin-token"
@@ -398,7 +753,29 @@ function renderAuthHtml() {
       const input = document.getElementById("admin-token");
       const error = document.getElementById("admin-error");
       const submit = document.getElementById("admin-submit");
+      const themeToggle = document.getElementById("theme-toggle");
+
+      const readStoredTheme = () => {
+        try {
+          return localStorage.getItem("${THEME_STORAGE_KEY}") === "dark" ? "dark" : "light";
+        } catch {
+          return document.documentElement.dataset.theme === "dark" ? "dark" : "light";
+        }
+      };
+
+      const applyTheme = (theme) => {
+        const nextTheme = theme === "dark" ? "dark" : "light";
+        document.documentElement.dataset.theme = nextTheme;
+        try {
+          localStorage.setItem("${THEME_STORAGE_KEY}", nextTheme);
+        } catch {}
+        if (themeToggle) {
+          themeToggle.textContent = nextTheme === "dark" ? "浅色模式" : "暗色模式";
+        }
+      };
+
       if (input) input.focus();
+      applyTheme(readStoredTheme());
 
       const setError = (message) => {
         if (!error) return;
@@ -420,6 +797,11 @@ function renderAuthHtml() {
 
       if (submit) submit.addEventListener("click", attempt);
       if (input) input.addEventListener("keydown", (e) => { if (e.key === "Enter") attempt(); });
+      if (themeToggle) {
+        themeToggle.addEventListener("click", () => {
+          applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
+        });
+      }
     </script>
   </body>
 </html>`;
@@ -434,13 +816,8 @@ function renderHtml() {
     <title>Temp Mail Console</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
-    <style>
-      body { font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
-      ::-webkit-scrollbar { width: 6px; height: 6px; }
-      ::-webkit-scrollbar-track { background: transparent; }
-      ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
-      ::-webkit-scrollbar-thumb:hover { background: #475569; }
-    </style>
+    ${renderThemeBootScript()}
+    <style>${renderThemeStyles()}</style>
   </head>
   <body class="bg-[#09090b] text-slate-300 antialiased selection:bg-indigo-500/30">
     <div id="app" class="min-h-screen">
@@ -455,12 +832,15 @@ function renderHtml() {
               <p class="text-xs text-slate-400 mt-0.5">Cloudflare Workers · D1 Database</p>
             </div>
           </div>
-          <div class="flex items-center gap-2">
-            <span class="relative flex h-2 w-2">
-              <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-              <span class="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
-            </span>
-            <span class="text-[11px] font-medium text-slate-400 uppercase tracking-wider">Live</span>
+          <div class="flex items-center gap-3">
+            <div class="flex items-center gap-2">
+              <span class="relative flex h-2 w-2">
+                <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                <span class="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+              </span>
+              <span class="text-[11px] font-medium text-slate-400 uppercase tracking-wider">Live</span>
+            </div>
+            <button id="theme-toggle" type="button" class="theme-toggle rounded-xl px-3 py-2 text-[12px] font-medium">暗色模式</button>
           </div>
         </div>
       </header>
@@ -687,6 +1067,30 @@ data.results: 命中结果对象序列 [{ rule_id: 1, value: "123", remark: "备
 
     <script>
       const { createApp } = Vue;
+      const getThemeToggle = () => document.getElementById("theme-toggle");
+
+      const readStoredTheme = () => {
+        try {
+          return localStorage.getItem("${THEME_STORAGE_KEY}") === "dark" ? "dark" : "light";
+        } catch {
+          return document.documentElement.dataset.theme === "dark" ? "dark" : "light";
+        }
+      };
+
+      const applyTheme = (theme) => {
+        const nextTheme = theme === "dark" ? "dark" : "light";
+        document.documentElement.dataset.theme = nextTheme;
+        try {
+          localStorage.setItem("${THEME_STORAGE_KEY}", nextTheme);
+        } catch {}
+        const themeToggle = getThemeToggle();
+        if (themeToggle) {
+          themeToggle.textContent = nextTheme === "dark" ? "浅色模式" : "暗色模式";
+        }
+      };
+
+      applyTheme(readStoredTheme());
+
       createApp({
         data() {
           return {
@@ -871,6 +1275,12 @@ data.results: 命中结果对象序列 [{ rule_id: 1, value: "123", remark: "备
           }
         }
       }).mount("#app");
+
+      document.addEventListener("click", (event) => {
+        if (event.target instanceof Element && event.target.closest("#theme-toggle")) {
+          applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
+        }
+      });
 
       function getCookieValue(name) {
         const match = document.cookie.match(new RegExp("(?:^|; )" + name + "=([^;]*)"));
