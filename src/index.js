@@ -189,8 +189,7 @@ async function handleEmailsLatest(url, env) {
 
   if (!row) return jsonError("message not found", 404);
 
-  const parsed = safeParseJson(row.extracted_json);
-  const results = Array.isArray(parsed) ? parsed : [];
+  const results = normalizeExtractedMatches(safeParseJson(row.extracted_json));
   const primaryResult = results[0] || null;
 
   return new Response(
@@ -210,11 +209,16 @@ async function handleAdminEmails(url, env) {
     env.DB.prepare("SELECT COUNT(1) as total FROM emails").first()
   ]);
 
+  const items = list.results.map((item) => ({
+    ...item,
+    extracted_json: JSON.stringify(normalizeExtractedMatches(safeParseJson(item.extracted_json)))
+  }));
+
   return json({
     page,
     pageSize: PAGE_SIZE,
     total: countRow?.total || 0,
-    items: list.results,
+    items,
     debugBodyRetentionDays: getDebugBodyRetentionDays(env)
   });
 }
@@ -562,8 +566,12 @@ function applyRules(content, sender, rules) {
 }
 
 function scoreRuleMatchCandidate(rule, value, matchIndex) {
+  return scoreMatchValue(value, rule?.remark, matchIndex);
+}
+
+function scoreMatchValue(value, remark, matchIndex) {
   const normalizedValue = String(value || "").trim();
-  const remarkValue = String(rule?.remark || "").trim();
+  const remarkValue = String(remark || "").trim();
   let score = 0;
 
   if (/^\d{6}$/.test(normalizedValue)) score += 320;
@@ -580,6 +588,24 @@ function scoreRuleMatchCandidate(rule, value, matchIndex) {
 
   score += Math.max(0, 20 - Math.min(normalizedValue.length, 20));
   return score;
+}
+
+function normalizeExtractedMatches(matches) {
+  if (!Array.isArray(matches)) return [];
+
+  const candidates = matches
+    .map((match, index) => ({
+      rule_id: Number(match?.rule_id),
+      value: String(match?.value || "").trim(),
+      remark: match?.remark ? String(match.remark) : null,
+      score: scoreMatchValue(match?.value, match?.remark, index),
+      matchIndex: index
+    }))
+    .filter((candidate) => candidate.value);
+
+  return rankRuleMatchCandidates(candidates)
+    .slice(0, MAX_EXTRACTED_RESULTS)
+    .map(({ rule_id, value, remark }) => ({ rule_id, value, remark }));
 }
 
 function rankRuleMatchCandidates(candidates) {
