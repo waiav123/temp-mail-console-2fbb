@@ -58,6 +58,34 @@ const MATCH_REMARK_PRIORITY_HINTS = [
   /\botp\b/i,
   /\bpasscode\b/i
 ];
+const MATCH_CONTEXT_PRIORITY_HINTS = [
+  /验证码/i,
+  /校验码/i,
+  /动态码/i,
+  /安全码/i,
+  /提取码/i,
+  /code/i,
+  /\botp\b/i,
+  /verify/i,
+  /verification/i,
+  /login/i,
+  /sign-?in/i,
+  /auth/i,
+  /2fa/i,
+  /one-?time/i
+];
+const MATCH_CONTEXT_NOISE_HINTS = [
+  /订单/i,
+  /金额/i,
+  /余额/i,
+  /价格/i,
+  /电话/i,
+  /客服/i,
+  /tracking/i,
+  /invoice/i,
+  /price/i,
+  /support/i
+];
 const htmlToText = compile({
   wordwrap: false,
   selectors: [
@@ -546,13 +574,14 @@ function applyRules(content, sender, rules) {
   for (const rule of rules) {
     if (!senderMatches(senderValue, rule.sender_filter)) continue;
     try {
-      const match = new RegExp(rule.pattern, "m").exec(content);
-      if (match?.[0]) {
+      for (const match of findRuleMatches(content, rule.pattern)) {
+        const extractedValue = extractRuleMatchValue(match);
+        if (!extractedValue) continue;
         candidates.push({
           rule_id: rule.id,
-          value: String(match[0]).trim(),
+          value: extractedValue,
           remark: rule.remark || null,
-          score: scoreRuleMatchCandidate(rule, match[0], match.index),
+          score: scoreRuleMatchCandidate(rule, extractedValue, match.index, content),
           matchIndex: Number.isFinite(match.index) ? match.index : Number.MAX_SAFE_INTEGER
         });
       }
@@ -565,11 +594,35 @@ function applyRules(content, sender, rules) {
     .map(({ rule_id, value, remark }) => ({ rule_id, value, remark }));
 }
 
-function scoreRuleMatchCandidate(rule, value, matchIndex) {
-  return scoreMatchValue(value, rule?.remark, matchIndex);
+function findRuleMatches(content, pattern) {
+  const matches = [];
+  const regex = new RegExp(pattern, "gm");
+  let match = null;
+
+  while ((match = regex.exec(content)) !== null) {
+    matches.push(match);
+    if (match[0] === "") regex.lastIndex += 1;
+  }
+
+  return matches;
 }
 
-function scoreMatchValue(value, remark, matchIndex) {
+function extractRuleMatchValue(match) {
+  if (!match) return "";
+
+  for (let index = 1; index < match.length; index += 1) {
+    const captured = String(match[index] || "").trim();
+    if (captured) return captured;
+  }
+
+  return String(match[0] || "").trim();
+}
+
+function scoreRuleMatchCandidate(rule, value, matchIndex, content) {
+  return scoreMatchValue(value, rule?.remark, matchIndex, content);
+}
+
+function scoreMatchValue(value, remark, matchIndex, content = "") {
   const normalizedValue = String(value || "").trim();
   const remarkValue = String(remark || "").trim();
   let score = 0;
@@ -581,6 +634,11 @@ function scoreMatchValue(value, remark, matchIndex) {
   else if (/\d/.test(normalizedValue)) score += 80;
 
   if (MATCH_REMARK_PRIORITY_HINTS.some((pattern) => pattern.test(remarkValue))) score += 45;
+  const positiveDistance = findNearestPatternDistance(content, matchIndex, normalizedValue.length, MATCH_CONTEXT_PRIORITY_HINTS);
+  const noiseDistance = findNearestPatternDistance(content, matchIndex, normalizedValue.length, MATCH_CONTEXT_NOISE_HINTS);
+
+  if (Number.isFinite(positiveDistance)) score += Math.max(0, 120 - positiveDistance * 5);
+  if (Number.isFinite(noiseDistance)) score -= Math.max(0, 95 - noiseDistance * 4);
 
   if (Number.isFinite(matchIndex)) {
     score += Math.max(0, 24 - Math.floor(matchIndex / 48));
@@ -588,6 +646,42 @@ function scoreMatchValue(value, remark, matchIndex) {
 
   score += Math.max(0, 20 - Math.min(normalizedValue.length, 20));
   return score;
+}
+
+function findNearestPatternDistance(content, matchIndex, matchLength, patterns) {
+  if (!content || !Number.isFinite(matchIndex)) return Number.POSITIVE_INFINITY;
+
+  const source = String(content);
+  const matchStart = matchIndex;
+  const matchEnd = matchIndex + Math.max(matchLength, 1);
+  let nearest = Number.POSITIVE_INFINITY;
+
+  for (const pattern of patterns) {
+    const regex = toGlobalRegex(pattern);
+    let found = null;
+
+    while ((found = regex.exec(source)) !== null) {
+      const foundStart = found.index;
+      const foundEnd = found.index + Math.max(String(found[0] || "").length, 1);
+      const distance = getSegmentDistance(matchStart, matchEnd, foundStart, foundEnd);
+      if (distance < nearest) nearest = distance;
+      if (found[0] === "") regex.lastIndex += 1;
+    }
+  }
+
+  return nearest;
+}
+
+function toGlobalRegex(pattern) {
+  const flags = new Set(String(pattern.flags || "").split("").filter(Boolean));
+  flags.add("g");
+  return new RegExp(pattern.source, [...flags].join(""));
+}
+
+function getSegmentDistance(leftStart, leftEnd, rightStart, rightEnd) {
+  if (rightEnd < leftStart) return leftStart - rightEnd;
+  if (rightStart > leftEnd) return rightStart - leftEnd;
+  return 0;
 }
 
 function normalizeExtractedMatches(matches) {
