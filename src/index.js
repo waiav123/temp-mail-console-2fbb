@@ -6,6 +6,7 @@ import { parse as parseDomain } from "tldts";
 const PAGE_SIZE = 20;
 const RULES_PAGE_SIZE = 12;
 const MAX_RANKED_URLS = 20;
+const MAX_EXTRACTED_RESULTS = 1;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const EMAIL_RETENTION_DAYS = 2;
 const DEFAULT_DEBUG_BODY_RETENTION_DAYS = 2;
@@ -45,6 +46,17 @@ const URL_NOISE_HINTS = [
   /tracking/i,
   /pixel/i,
   /\.(?:png|jpe?g|gif|svg|webp|ico|css|js)(?:[?#]|$)/i
+];
+const MATCH_REMARK_PRIORITY_HINTS = [
+  /验证码/i,
+  /校验码/i,
+  /动态码/i,
+  /登录码/i,
+  /verification code/i,
+  /verify code/i,
+  /login code/i,
+  /\botp\b/i,
+  /\bpasscode\b/i
 ];
 const htmlToText = compile({
   wordwrap: false,
@@ -179,9 +191,10 @@ async function handleEmailsLatest(url, env) {
 
   const parsed = safeParseJson(row.extracted_json);
   const results = Array.isArray(parsed) ? parsed : [];
+  const primaryResult = results[0] || null;
 
   return new Response(
-    JSON.stringify({ code: 200, data: { from_address: row.from_address, to_address: row.to_address, received_at: row.received_at, results } }),
+    JSON.stringify({ code: 200, data: { from_address: row.from_address, to_address: row.to_address, received_at: row.received_at, primary_result: primaryResult, results } }),
     { headers: { "Content-Type": "application/json; charset=utf-8", ...CORS_HEADERS } }
   );
 }
@@ -525,19 +538,71 @@ async function loadRules(db) {
 
 function applyRules(content, sender, rules) {
   const senderValue = String(sender || "").toLowerCase();
-  const outputs = [];
+  const candidates = [];
   for (const rule of rules) {
     if (!senderMatches(senderValue, rule.sender_filter)) continue;
     try {
-      const match = content.match(new RegExp(rule.pattern, "m"));
+      const match = new RegExp(rule.pattern, "m").exec(content);
       if (match?.[0]) {
-        outputs.push({ rule_id: rule.id, value: match[0], remark: rule.remark || null });
+        candidates.push({
+          rule_id: rule.id,
+          value: String(match[0]).trim(),
+          remark: rule.remark || null,
+          score: scoreRuleMatchCandidate(rule, match[0], match.index),
+          matchIndex: Number.isFinite(match.index) ? match.index : Number.MAX_SAFE_INTEGER
+        });
       }
     } catch {
       continue;
     }
   }
-  return outputs;
+  return rankRuleMatchCandidates(candidates)
+    .slice(0, MAX_EXTRACTED_RESULTS)
+    .map(({ rule_id, value, remark }) => ({ rule_id, value, remark }));
+}
+
+function scoreRuleMatchCandidate(rule, value, matchIndex) {
+  const normalizedValue = String(value || "").trim();
+  const remarkValue = String(rule?.remark || "").trim();
+  let score = 0;
+
+  if (/^\d{6}$/.test(normalizedValue)) score += 320;
+  else if (/^\d{4,8}$/.test(normalizedValue)) score += 260;
+  else if (/^(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9]{6,8}$/.test(normalizedValue)) score += 180;
+  else if (/^https?:\/\//i.test(normalizedValue)) score += 40;
+  else if (/\d/.test(normalizedValue)) score += 80;
+
+  if (MATCH_REMARK_PRIORITY_HINTS.some((pattern) => pattern.test(remarkValue))) score += 45;
+
+  if (Number.isFinite(matchIndex)) {
+    score += Math.max(0, 24 - Math.floor(matchIndex / 48));
+  }
+
+  score += Math.max(0, 20 - Math.min(normalizedValue.length, 20));
+  return score;
+}
+
+function rankRuleMatchCandidates(candidates) {
+  const bestByValue = new Map();
+
+  for (const candidate of candidates) {
+    const key = String(candidate.value || "").trim().toLowerCase();
+    if (!key) continue;
+
+    const previous = bestByValue.get(key);
+    if (!previous || compareRuleMatchCandidates(candidate, previous) < 0) {
+      bestByValue.set(key, candidate);
+    }
+  }
+
+  return [...bestByValue.values()].sort(compareRuleMatchCandidates);
+}
+
+function compareRuleMatchCandidates(left, right) {
+  if (right.score !== left.score) return right.score - left.score;
+  if (left.matchIndex !== right.matchIndex) return left.matchIndex - right.matchIndex;
+  if (left.value.length !== right.value.length) return left.value.length - right.value.length;
+  return right.rule_id - left.rule_id;
 }
 
 function senderInWhitelist(sender, whitelist) {
@@ -1163,12 +1228,14 @@ Response: {
     "from_address": "sender@example.com",
     "to_address": "target@domain.com",
     "received_at": 1741881600000,
+    "primary_result": { "rule_id": 1, "value": "123", "remark": "备注" },
     "results": [
       { "rule_id": 1, "value": "123", "remark": "备注" }
     ]
   }
 }
 data.received_at: 收件时间戳
+data.primary_result: 当前最优命中结果，没有命中时为 null
 data.results: 命中结果对象序列 [{ rule_id: 1, value: "123", remark: "备注" }]</pre>
             </div>
           </div>
