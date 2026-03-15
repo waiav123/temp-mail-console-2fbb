@@ -27,9 +27,9 @@
 
 并且当前正文预处理已经增强为：
 
-- `postal-mime + cheerio + html-to-text + he + email-reply-parser + libphonenumber-js + get-urls + tldts`
+- `postal-mime + cheerio + html-to-text + he + libphonenumber-js + get-urls + tldts`
 - HTML 会先做 DOM 预清洗，再转文本
-- 回复链、签名、footer、tracking 块会尽量在匹配前剔除
+- 回复链、签名、footer、tracking 块会尽量在匹配前通过启发式规则剔除
 - 支持电话类数字噪音会尽量在匹配前剔除
 - 被拆散的验证码片段会先尝试归并
 
@@ -74,4 +74,3 @@
 - 本机 `wrangler` 当前未登录。
 - 线上发布通过 GitHub push 触发 Cloudflare Workers Builds 自动构建。
 - 文档更新时间之后的最新功能，应以 `main` 分支和最近一次成功的 Cloudflare build 为准。
-- 当前 `wrangler.toml` 已启用 `compatibility_flags = ["nodejs_compat"]`，因为 `email-reply-parser` 依赖该兼容层。

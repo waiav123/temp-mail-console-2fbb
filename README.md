@@ -21,7 +21,7 @@
 2. 使用 `cheerio` 预清洗 HTML，移除 `script/style/noscript`、引用块、常见 footer / tracking / hidden 节点。
 3. 使用 `html-to-text` 将清洗后的 HTML 转成可读文本。
 4. 使用 `he` 做 HTML entity 解码，并统一文本宽度与空白字符。
-5. 使用 `email-reply-parser` 剥离回复链、签名和明显引用正文。
+5. 使用内置启发式规则剥离回复链、签名和明显引用正文。
 6. 使用 `libphonenumber-js` 识别支持电话类数字噪音，并在归一化文本中剔除。
 7. 使用 `get-urls` 提取链接，再结合 `tldts` 做域名归一、排序和 URL 候选补充。
 8. 将提取输入统一改为：
@@ -76,7 +76,6 @@ npx wrangler d1 execute temp-email-db --file=schema.sql
 name = "temp-mail-console"
 main = "src/index.js"
 compatibility_date = "2024-11-01"
-compatibility_flags = ["nodejs_compat"]
 
 [[d1_databases]]
 binding = "DB"
@@ -98,8 +97,6 @@ crons = ["0 * * * *"]
 ```
 
 生产环境建议使用 `wrangler secret put` 设置敏感变量，不要直接写入仓库。
-
-说明：当前版本启用了 `email-reply-parser`，因此 Worker 需要开启 `nodejs_compat`。
 
 #### 5. 本地开发
 

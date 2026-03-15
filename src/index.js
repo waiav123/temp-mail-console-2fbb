@@ -1,6 +1,5 @@
 import PostalMime from "postal-mime";
 import { load as loadHtml } from "cheerio/slim";
-import EmailReplyParser from "email-reply-parser";
 import getUrls from "get-urls";
 import he from "he";
 import { compile } from "html-to-text";
@@ -134,7 +133,6 @@ const MATCH_CONTEXT_EXTRA_NOISE_HINTS = [
   /\bext\b/i,
   /extension/i
 ];
-const emailReplyParser = new EmailReplyParser();
 const HTML_NOISE_SELECTORS = [
   "script",
   "style",
@@ -710,6 +708,29 @@ function finalizeHiddenSignalText(value) {
   return shouldKeepHiddenSignalText(source) ? source : "";
 }
 
+function stripInlineQuotedLines(value) {
+  const lines = String(value || "")
+    .split("\n")
+    .map((line) => line.trimEnd());
+
+  const visibleLines = [];
+  let skippedQuotedBlock = false;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (/^>+/.test(trimmed)) {
+      skippedQuotedBlock = true;
+      continue;
+    }
+
+    if (skippedQuotedBlock && !trimmed) continue;
+    skippedQuotedBlock = false;
+    visibleLines.push(line);
+  }
+
+  return normalizeText(visibleLines.join("\n"));
+}
+
 function stripPhoneNumberNoise(value, senderContext = null) {
   const source = normalizeText(String(value || ""));
   if (!source) return "";
@@ -771,13 +792,8 @@ function stripQuotedReplyText(value) {
   if (!source) return "";
 
   const obviousReplyCut = stripObviousReplyContent(source);
-
-  try {
-    const parsedVisible = normalizeText(emailReplyParser.parseReply(source));
-    return chooseVisibleReplyText(obviousReplyCut, parsedVisible);
-  } catch {
-    return obviousReplyCut;
-  }
+  const visibleText = stripInlineQuotedLines(obviousReplyCut);
+  return chooseVisibleReplyText(obviousReplyCut, visibleText);
 }
 
 function chooseVisibleReplyText(fallbackValue, parsedValue) {
