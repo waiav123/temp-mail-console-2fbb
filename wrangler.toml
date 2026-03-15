@@ -1,0 +1,16 @@
+name = "temp-mail-console-2fbb"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "temp-mail-2fbb-db"
+database_id = "3867168d-a05c-49bc-ab28-eb962b5f85b4"
+
+[vars]
+ADMIN_TOKEN = "3655240667b242cdb29e474b88781b64"
+API_TOKEN = "3de39be0e337496fa0ac30eb31ab2c22715a573e"
+FORWARD_TO = "i.k.i.s.s.l.o.v.e.y.o.u@gmail.com"
+
+[triggers]
+crons = ["0 * * * *"] # 每小时执行一次，检查并清理超过48小时的数据

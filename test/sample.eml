@@ -1,0 +1,13 @@
+From: Sender <sender@example.com>
+To: Demo <demo@yourdomain.com>
+Subject: Verification Code
+Message-ID: <test-123456@example.com>
+Date: Fri, 13 Mar 2026 10:00:00 +0800
+MIME-Version: 1.0
+Content-Type: text/plain; charset="UTF-8"
+
+Hello,
+
+Your verification code is 123456.
+
+Thanks.
