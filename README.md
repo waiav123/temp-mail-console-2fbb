@@ -1,171 +1,203 @@
 # Temp Mail Console
 
-基于 **Cloudflare Workers + D1** 的临时邮箱控制台。接收邮件后，根据可配置的正则规则自动提取关键数据（如验证码），并通过 API 对外提供查询能力。
+基于 **Cloudflare Workers + D1** 的临时邮箱控制台。接收邮件后，按可配置规则提取验证码、链接等关键信息，并通过后台和 API 提供查询与调试能力。
 
 ## 功能
 
-- 🧩 **控制台管理**：邮件列表、规则管理、白名单管理与 API 对接说明。
-- 🛡️ **发件人白名单**：基于正则表达式过滤发信人，不匹配直接忽略。
-- 🔍 **内容正则提取**：对邮件正文进行正则匹配，提取验证码等关键信息。
-- 🖥️ **RESTful API**：对外提供查询接口，便于系统集成。
-- 🔄 **全局邮件转发**：入库后可自动转发原始邮件到真实邮箱。
-- 🧹 **记录自动清理**：Cron 每小时清理 48 小时前的历史数据，防止数据库膨胀。
-- ☁️ **无服务器架构**：基于 Cloudflare Workers + D1，支持低成本托管。
+- 控制台管理：邮件列表、规则管理、白名单管理、调试正文查看。
+- 发件人白名单：白名单为空时接收所有发件人；配置后仅处理匹配项。
+- 正则提取：支持验证码、数字码、字母数字混合码、链接等内容提取。
+- 提取排序：同一封邮件命中多个候选值时，自动选出最优主结果。
+- 调试正文：可短期保存最近 N 天的 `text/html/normalized_text/ranked_urls` 用于排查。
+- REST API：对外提供最新命中结果查询接口。
+- 可选转发：入库后可继续转发原始邮件到真实邮箱。
+- 定时清理：Cron 自动删除过期邮件与过期调试正文。
 
-## 界面预览
+## 当前提取链路
 
-<table>
-  <tr>
-    <td align="center"><img src="images/pqvxt.png" alt="控制台-邮件列表" width="260" /></td>
-    <td align="center"><img src="images/nldhs.png" alt="控制台-命中规则" width="260" /></td>
-    <td align="center"><img src="images/kbrya.png" alt="控制台-白名单" width="260" /></td>
-  </tr>
-</table>
+当前 Worker 的正文处理流程如下：
 
+1. 使用 `postal-mime` 解析邮件。
+2. 使用 `html-to-text` 将 HTML 转成可读文本。
+3. 归一化文本，去除多余空白与重复内容。
+4. 使用 `get-urls` 提取链接，再结合 `tldts` 做域名排序。
+5. 将提取输入统一改为：
+
+```text
+subject + normalized_text + ranked_urls
+```
+
+6. 对规则执行全量匹配，不再只看单条规则的第一个命中。
+7. 如果规则使用了捕获组，优先返回第一个非空捕获组，而不是整段匹配文本。
+8. 按候选值类型、备注关键词、上下文距离、噪音词等因素排序，输出最优结果。
 
 ## 快速开始
 
-### 方式一：一键部署（推荐）
+### 方式一：一键部署
 
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/beyoug/temp-mail-console)
 
-> 点击上方按钮可全自动 Fork 并在你的 Cloudflare 账户上部署该项目，自动分配 D1 数据库资源。部署后别忘了按下方指南设置必须的环境变量（如 ADMIN_TOKEN 和 API_TOKEN）以及邮件路由。
-
-> 提示：最新版本在首次访问控制台或收到第一封邮件时会自动初始化表结构。如果希望提前手动初始化，可在本地执行 `npx wrangler d1 execute temp-email-db --file=schema.sql`（使用远程 DB）。
-
----
+首次访问后台或首次收到邮件时，Worker 会自动初始化 D1 表结构。
 
 ### 方式二：手动部署
 
-### 1. 安装依赖
+#### 1. 安装依赖
 
 ```bash
 npm install
 ```
 
-### 2. 创建 D1 数据库（首次）
+#### 2. 创建 D1 数据库
 
 ```bash
-# 创建远程数据库
 npx wrangler d1 create temp-email-db
-
-# 将输出的 database_id 填入 wrangler.toml
 ```
 
-### 3. 初始化表结构
+将输出的 `database_id` 写入 `wrangler.toml`。
+
+#### 3. 初始化表结构
 
 ```bash
 # 本地
 npx wrangler d1 execute temp-email-db --local --file=schema.sql
 
-# 远程（正式部署后）
+# 远程
 npx wrangler d1 execute temp-email-db --file=schema.sql
 ```
 
-> 说明：最新版本会在首次请求时自动创建表结构，以上命令可用于手动初始化或重新修复表结构。
+说明：当前版本支持自动建表，上述命令主要用于手动初始化或修复。
 
-### 4. 配置 wrangler.toml
+#### 4. 配置 `wrangler.toml`
 
 ```toml
+name = "temp-mail-console"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
 [[d1_databases]]
 binding = "DB"
 database_name = "temp-email-db"
-database_id = "your-d1-database-id"   # 替换为实际 ID
+database_id = "your-d1-database-id"
 
 [vars]
-ADMIN_TOKEN = "your-admin-token"   # 后台登录密码
+ADMIN_TOKEN = "your-admin-token"
 API_TOKEN = "your-api-token"
 
-# [可选] 开启后自动转发原始邮件（该邮箱需在 Cloudflare Email Routing 的 Destination addresses 中完成验证）
+# 可选：调试正文保留天数，默认 2，设为 0 表示关闭
+# DEBUG_BODY_RETENTION_DAYS = "2"
+
+# 可选：提取后继续转发原始邮件
 # FORWARD_TO = "your-real@email.com"
 
 [triggers]
-crons = ["0 * * * *"] # 每小时执行一次，自动清理超过 48 小时的数据库记录
+crons = ["0 * * * *"]
 ```
 
-> ⚠️ 生产环境建议通过 `wrangler secret put` 设置 `ADMIN_TOKEN` 和 `API_TOKEN`，不要写在 `wrangler.toml` 中。
+生产环境建议使用 `wrangler secret put` 设置敏感变量，不要直接写入仓库。
 
-### 5. 本地开发
+#### 5. 本地开发
 
 ```bash
 npm run dev
-# 访问 http://localhost:8787
 ```
 
-### 6. 部署
+访问 `http://localhost:8787/`。
+
+#### 6. 部署
 
 ```bash
 npm run deploy
 ```
 
-### 7. 配置邮件路由 (Email Routing)
+## Email Routing 配置
 
-- 在 Cloudflare 控制台左侧菜单，找到 **Email** -> **Email Routing**
-- 进入 **Routes** 配置页
-- 根据需要配置 **Catch-all address** 或具体的 **Custom addresses** (Destination 均选择 `Send to a Worker`，并选择刚才部署的 `temp-email-worker`)。
+- 在 Cloudflare 控制台进入 **Email -> Email Routing**。
+- 配置 `Catch-all address` 或 `Custom addresses`。
+- 动作选择 **Send to a Worker**，并绑定当前 Worker。
 
-> [!IMPORTANT]
-> 当你在 Cloudflare 邮件路由中将动作设置为 **"Send to a Worker"** 时，Cloudflare **不再**会自动将该邮件投递/转发到你原本的个人收件箱。Worker 会完全接管这条邮件的处理权。
-> **如何启用自动转发**：如果你希望 Worker 提取数据的同时，也将原邮件转发到你的真实邮箱，可以通过 `wrangler dev` 环境变量或在 Cloudflare 控制台的该 Worker **Settings -> Variables** 中增加 `FORWARD_TO` 变量，值为你的真实收件箱地址（注意：该接收地址必须是在 Cloudflare Email Routing 中已验证过的 Destination Address）。
+重要说明：
 
-## 邮件转发配置
+- 设为 **Send to a Worker** 后，Cloudflare 不会再自动把邮件转发到你的真实邮箱。
+- 如果希望“提取 + 转发”同时进行，需要额外设置 `FORWARD_TO`。
+- `FORWARD_TO` 对应地址必须是 Cloudflare Email Routing 中已验证过的 Destination Address。
 
-1. 在 Cloudflare **Email Routing** 的 **Destination addresses** 中添加并验证你的真实邮箱。
-2. 在 Worker 变量中设置 `FORWARD_TO`：
+## 环境变量
 
-```bash
-# 本地开发（dev）
-FORWARD_TO="your-real@email.com" npm run dev
+| 变量名 | 必填 | 说明 |
+|------|------|------|
+| `ADMIN_TOKEN` | 是 | 后台登录与 `/admin/*` 接口鉴权 |
+| `API_TOKEN` | 是 | `/api/*` 接口鉴权 |
+| `DEBUG_BODY_RETENTION_DAYS` | 否 | 调试正文保留天数，默认 `2`，设为 `0` 关闭 |
+| `FORWARD_TO` | 否 | 提取后继续转发原始邮件 |
 
-# 线上环境（推荐使用 secret）
-npx wrangler secret put FORWARD_TO
-```
+## 管理后台
 
-3. 生产环境也可在 Cloudflare 控制台 Worker **Settings -> Variables** 中添加 `FORWARD_TO`。
+- 访问 `https://<your-worker-domain>/`
+- 输入 `ADMIN_TOKEN` 登录
+- 登录后可查看：
+  - 邮件列表
+  - 命中规则
+  - 白名单
+  - 调试正文
 
-> 提示：当 `FORWARD_TO` 为空时不会执行转发，仍会正常入库与规则解析。
+后台的“查看调试正文”会展示：
 
-## 管理控制台
+- `text_content`
+- `html_content`
+- `normalized_text`
+- `ranked_urls`
+- 保存时间与过期时间
 
-- 访问 `https://<your-worker-domain>/`，输入 `ADMIN_TOKEN` 登录。
-- 登录成功后会写入 `admin_token` Cookie；也可以通过 `Authorization: Bearer <ADMIN_TOKEN>` 访问 `/admin/*` 接口。
+## API
 
-### API 鉴权
+### 鉴权
 
-```
+```http
 Authorization: Bearer <API_TOKEN>
 ```
 
-### 查询最新命中结果
+### 查询最新地址的最新命中结果
 
-```
+```http
 GET /api/emails/latest?address=<email_address>
 ```
 
-**响应：**
+### 响应示例
 
 ```json
 {
   "code": 200,
   "data": {
-    "from_address": "noreply@example.com",
-    "to_address": "user@yourdomain.com",
+    "from_address": "otp@example.com",
+    "to_address": "demo@yourdomain.com",
     "received_at": 1741881600000,
+    "primary_result": {
+      "rule_id": 1,
+      "value": "123456",
+      "remark": "验证码"
+    },
     "results": [
-      { "rule_id": 1, "value": "123456", "remark": "验证码" }
+      {
+        "rule_id": 1,
+        "value": "123456",
+        "remark": "验证码"
+      }
     ]
   }
 }
 ```
 
+### 字段说明
+
 | 字段 | 说明 |
 |------|------|
 | `from_address` | 发件人邮箱 |
-| `to_address` | 收件人邮箱（多个收件人时用逗号分隔） |
-| `received_at` | 收件时间戳（毫秒） |
-| `results` | 命中结果数组，每项包含 `rule_id`、`value`、`remark` |
+| `to_address` | 收件人邮箱，多个地址时逗号拼接 |
+| `received_at` | 收件时间戳，毫秒 |
+| `primary_result` | 当前最优命中结果，无命中时为 `null` |
+| `results` | 归一化后的命中结果数组，当前默认只返回最优 1 条 |
 
-**错误响应：**
+### 常见错误
 
 ```json
 { "code": 404, "message": "message not found" }
@@ -173,37 +205,88 @@ GET /api/emails/latest?address=<email_address>
 
 ## 规则说明
 
-每条规则由三部分组成：
+每条规则包含 3 个字段：
 
 | 字段 | 说明 |
 |------|------|
-| `remark` | 备注名称，作为返回结果的标签（可选） |
-| `sender_filter` | 发信人过滤，支持正则，多个用逗号或换行分隔，留空匹配所有 |
-| `pattern` | 内容提取正则，对邮件正文匹配，取第一个完整匹配 |
+| `remark` | 备注名称，可作为返回结果标签 |
+| `sender_filter` | 发件人过滤正则，多个规则可用逗号或换行分隔，留空表示所有发件人都可命中该规则 |
+| `pattern` | 内容提取正则，对 `subject + normalized_text + ranked_urls` 做匹配 |
 
-## 白名单说明
+### 当前规则执行方式
 
-- 白名单为空时接受所有邮件。
-- 白名单规则支持正则表达式，匹配不通过的发件人将被直接忽略。
+- 单条规则会遍历全部命中，而不是只取第一个命中。
+- 如果规则里有捕获组，返回值优先取第一个非空捕获组。
+- 所有候选命中会统一排序后再输出最优结果。
 
-**示例**：提取来自 `example.com` 的6位验证码
+### 当前排序倾向
+
+- 6 位纯数字验证码优先级最高。
+- 4 到 8 位纯数字次之。
+- 6 到 8 位字母数字混合码次之。
+- 备注中含有 `验证码`、`OTP`、`verification code` 等词会加分。
+- 候选值附近如果出现 `code`、`verify`、`验证码` 等词会显著加分。
+- 候选值附近如果更接近 `订单`、`金额`、`price`、`support` 等噪音词会减分。
+
+### 示例 1：通用 6 位验证码
 
 | 字段 | 值 |
 |------|----|
-| remark | `验证码` |
-| sender_filter | `.*@example\.com` |
-| pattern | `\b\d{6}\b` |
+| `remark` | `验证码` |
+| `sender_filter` | 留空 |
+| `pattern` | `\b\d{6}\b` |
+
+### 示例 2：使用捕获组
+
+| 字段 | 值 |
+|------|----|
+| `remark` | `验证码` |
+| `sender_filter` | `.*@example\.com` |
+| `pattern` | `验证码[:： ]*(\d{6})` |
+
+在示例 2 中，系统最终返回的是 `123456`，不是整段 `验证码: 123456`。
+
+## 白名单说明
+
+- 白名单为空时，接收所有发件人和发件域名。
+- 白名单不为空时，只处理匹配白名单规则的发件人。
+- 白名单规则支持正则表达式。
+
+换句话说：
+
+- “能不能进入解析流程”取决于白名单。
+- “进入后哪些规则会命中”取决于各规则自己的 `sender_filter` 和正文格式。
+
+## 调试正文保留策略
+
+系统不会永久保存所有邮件正文。当前支持“只保存最近 N 天调试正文”：
+
+- 默认保留 `2` 天
+- 通过 `DEBUG_BODY_RETENTION_DAYS` 调整
+- 设置为 `0` 后，新邮件不再保存调试正文
+- 旧邮件不会自动回填调试正文
+
+当前调试正文表会保存：
+
+- `text_content`
+- `html_content`
+- `normalized_text`
+- `ranked_urls_json`
+- `created_at`
+- `expires_at`
+
+Cron 会自动清理过期调试正文。
 
 ## 本地测试
 
-**发送测试邮件（触发 email handler）：**
+### 发送测试邮件
 
 ```bash
 curl -X POST "http://localhost:8787/cdn-cgi/handler/email?from=sender@example.com&to=demo@yourdomain.com" \
   --data-binary @./test/sample.eml
 ```
 
-**查询最新命中结果：**
+### 查询最新命中结果
 
 ```bash
 curl "http://localhost:8787/api/emails/latest?address=demo@yourdomain.com" \
@@ -212,14 +295,14 @@ curl "http://localhost:8787/api/emails/latest?address=demo@yourdomain.com" \
 
 ## 项目结构
 
-```
+```text
 ├── src/
-│   └── index.js        # Worker 入口（邮件处理 + HTTP 路由 + 前端页面）
+│   └── index.js
 ├── test/
-│   └── sample.eml      # 本地测试用示例邮件
-├── images/             # README 截图
-├── schema.sql          # D1 建表语句
-├── wrangler.toml       # Wrangler 配置
+│   └── sample.eml
+├── images/
+├── schema.sql
+├── wrangler.toml
 └── package.json
 ```
 
