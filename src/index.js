@@ -1,6 +1,10 @@
 import PostalMime from "postal-mime";
+import { load as loadHtml } from "cheerio/slim";
+import EmailReplyParser from "email-reply-parser";
 import getUrls from "get-urls";
+import he from "he";
 import { compile } from "html-to-text";
+import { findPhoneNumbersInText } from "libphonenumber-js/min";
 import { parse as parseDomain } from "tldts";
 
 const PAGE_SIZE = 20;
@@ -47,6 +51,27 @@ const URL_NOISE_HINTS = [
   /pixel/i,
   /\.(?:png|jpe?g|gif|svg|webp|ico|css|js)(?:[?#]|$)/i
 ];
+const OTP_SIGNAL_HINTS = [
+  /验证码/i,
+  /校验码/i,
+  /动态码/i,
+  /安全码/i,
+  /确认码/i,
+  /提取码/i,
+  /认.?证.?码/i,
+  /\botp\b/i,
+  /\bpasscode\b/i,
+  /\bpin\b/i,
+  /verification(?:\s+code)?/i,
+  /verify(?:\s+code)?/i,
+  /security(?:\s+code)?/i,
+  /login(?:\s+code)?/i,
+  /sign-?in(?:\s+code)?/i,
+  /one-?time(?:\s+code| password)?/i,
+  /\b2fa\b/i,
+  /\bauth(?:entication)?\b/i,
+  /magic\s+link/i
+];
 const MATCH_REMARK_PRIORITY_HINTS = [
   /验证码/i,
   /校验码/i,
@@ -88,11 +113,111 @@ const MATCH_CONTEXT_NOISE_HINTS = [
 ];
 const htmlToText = compile({
   wordwrap: false,
+  preserveNewlines: true,
+  baseElements: {
+    selectors: ["body"],
+    returnDomByDefault: true
+  },
   selectors: [
     { selector: "a", options: { ignoreHref: true } },
-    { selector: "img", format: "skip" }
+    { selector: "img", format: "skip" },
+    { selector: "script", format: "skip" },
+    { selector: "style", format: "skip" },
+    { selector: "noscript", format: "skip" }
   ]
 });
+const MATCH_CONTEXT_EXTRA_NOISE_HINTS = [
+  /customer service/i,
+  /\btel\b/i,
+  /\bphone\b/i,
+  /\bcall\b/i,
+  /\bext\b/i,
+  /extension/i
+];
+const emailReplyParser = new EmailReplyParser();
+const HTML_NOISE_SELECTORS = [
+  "script",
+  "style",
+  "noscript",
+  "svg",
+  "canvas",
+  "video",
+  "audio",
+  "iframe",
+  "object",
+  "embed",
+  "meta",
+  "link",
+  "source",
+  "track",
+  "head",
+  "blockquote",
+  ".gmail_quote",
+  ".gmail_attr",
+  ".gmail_signature",
+  ".protonmail_quote",
+  ".yahoo_quoted",
+  ".moz-cite-prefix",
+  "[type='cite']"
+];
+const HTML_NOISE_ATTR_HINTS = [
+  /footer/i,
+  /signature/i,
+  /disclaimer/i,
+  /unsubscribe/i,
+  /preference/i,
+  /privacy/i,
+  /terms/i,
+  /legal/i,
+  /tracking/i,
+  /pixel/i,
+  /social/i,
+  /view-?in-?browser/i,
+  /web-?version/i
+];
+const HTML_PREHEADER_HINTS = [
+  /preheader/i,
+  /preview/i,
+  /visually-hidden/i,
+  /screen-reader/i,
+  /\bsr-only\b/i
+];
+const HIDDEN_STYLE_HINT = /display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0(?:[; ]|$)|max-height\s*:\s*0|max-width\s*:\s*0|height\s*:\s*0(?:px)?(?:[; ]|$)|width\s*:\s*0(?:px)?(?:[; ]|$)|overflow\s*:\s*hidden|font-size\s*:\s*0(?:px)?(?:[; ]|$)|line-height\s*:\s*0(?:px)?(?:[; ]|$)|mso-hide\s*:\s*all/i;
+const REPLY_SEPARATOR_PATTERNS = [
+  /^>+/m,
+  /^On .+wrote:$/im,
+  /^-{2,}\s*Original Message\s*-{2,}$/im,
+  /^From:\s.+$/im,
+  /^发件人[:：].+$/im,
+  /^在 .+写道[:：]?$/im
+];
+const GENERIC_PHONE_NOISE_PATTERN = /(?:\+?\d[\d(). \-]{7,}\d(?:\s*(?:x|ext\.?|extension|分机|轉|转)\s*\d{1,6})?)/gi;
+
+const URL_RANGE_REGEX = /https?:\/\/[^\s"'<>]+/gi;
+const URL_EXTRACTION_OPTIONS = {
+  requireSchemeOrWww: true
+};
+const DEFAULT_PHONE_COUNTRY_BY_TLD = {
+  au: "AU",
+  br: "BR",
+  ca: "CA",
+  cn: "CN",
+  de: "DE",
+  es: "ES",
+  fr: "FR",
+  gb: "GB",
+  hk: "HK",
+  in: "IN",
+  it: "IT",
+  jp: "JP",
+  kr: "KR",
+  mx: "MX",
+  sg: "SG",
+  tw: "TW",
+  uk: "GB",
+  us: "US"
+};
+const NANP_PHONE_HINT_PATTERN = /(?:\+?1[-.\s]*)?(?:\(\d{3}\)|\d{3})[-.\s]*\d{3}[-.\s]*\d{4}/;
 
 let schemaReadyPromise = null;
 
@@ -364,9 +489,14 @@ async function parseIncomingEmail(message) {
 }
 
 function buildExtractionContent(parsed) {
-  const subject = normalizeText(parsed.subject);
-  const normalizedText = buildNormalizedText(parsed);
-  const rankedUrls = buildRankedUrls(parsed, normalizedText);
+  const senderContext = getSenderContext(parsed.from);
+  const subject = stripPhoneNumberNoise(normalizeText(decodeHtmlEntities(parsed.subject)), senderContext);
+  const plainText = stripPhoneNumberNoise(preparePlainText(parsed.text), senderContext);
+  const htmlSignals = normalizeHtmlText(parsed.html);
+  htmlSignals.hiddenText = stripPhoneNumberNoise(htmlSignals.hiddenText, senderContext);
+  htmlSignals.visibleText = stripPhoneNumberNoise(htmlSignals.visibleText, senderContext);
+  const normalizedText = buildNormalizedText({ plainText, htmlSignals });
+  const rankedUrls = buildRankedUrls(parsed, normalizedText, plainText, htmlSignals);
   const content = [subject, normalizedText, rankedUrls.join("\n")]
     .filter(Boolean)
     .join("\n\n");
@@ -374,37 +504,70 @@ function buildExtractionContent(parsed) {
   return { subject, normalizedText, rankedUrls, content };
 }
 
-function buildNormalizedText(parsed) {
+function buildNormalizedText({ plainText, htmlSignals }) {
   const sections = [];
-  appendUniqueText(sections, normalizeText(parsed.text));
-  appendUniqueText(sections, normalizeHtmlText(parsed.html));
-  return stripDetectedUrls(sections.join("\n\n"));
+  appendUniqueText(sections, plainText);
+  appendUniqueText(sections, htmlSignals.hiddenText);
+  appendUniqueText(sections, htmlSignals.visibleText);
+  return stripPhoneNumberNoise(stripDetectedUrls(sections.join("\n\n")));
 }
 
 function normalizeHtmlText(html) {
   const source = String(html || "").trim();
-  if (!source) return "";
+  if (!source) {
+    return {
+      cleanedHtml: "",
+      urlCandidates: [],
+      hiddenText: "",
+      visibleText: ""
+    };
+  }
 
   try {
-    return normalizeText(htmlToText(source));
+    const $ = loadHtml(source, { decodeEntities: false });
+    const hiddenSignals = collectHiddenSignalTexts($);
+    removeHtmlNoise($);
+    const cleanedHtml = $.html() || source;
+
+    return {
+      cleanedHtml,
+      urlCandidates: extractHtmlUrlCandidates($),
+      hiddenText: finalizeHiddenSignalText(hiddenSignals.join("\n\n")),
+      visibleText: preparePlainText(safeHtmlToText(cleanedHtml))
+    };
   } catch (error) {
     console.error("HTML 转文本失败:", error);
-    return normalizeText(source.replace(/<[^>]+>/g, " "));
+    return {
+      cleanedHtml: source,
+      urlCandidates: [],
+      hiddenText: "",
+      visibleText: preparePlainText(source.replace(/<[^>]+>/g, " "))
+    };
   }
 }
 
-function buildRankedUrls(parsed, normalizedText) {
+function buildRankedUrls(parsed, normalizedText, plainText, htmlSignals) {
   const senderContext = getSenderContext(parsed.from);
   const candidates = new Map();
+  const upsertCandidate = (url, hint = "") => {
+    const normalizedUrl = normalizeCandidateUrl(url);
+    if (!normalizedUrl) return;
 
-  for (const source of [parsed.subject, parsed.text, parsed.html, normalizedText]) {
-    for (const url of safeExtractUrls(source)) {
-      const score = scoreUrl(url, senderContext);
-      const previousScore = candidates.get(url);
-      if (previousScore === undefined || score > previousScore) {
-        candidates.set(url, score);
-      }
+    const score = scoreUrl(normalizedUrl, senderContext, hint);
+    const previousScore = candidates.get(normalizedUrl);
+    if (previousScore === undefined || score > previousScore) {
+      candidates.set(normalizedUrl, score);
     }
+  };
+
+  for (const source of [parsed.subject, plainText, htmlSignals.hiddenText, htmlSignals.visibleText, htmlSignals.cleanedHtml, normalizedText]) {
+    for (const url of safeExtractUrls(source)) {
+      upsertCandidate(url);
+    }
+  }
+
+  for (const candidate of htmlSignals.urlCandidates || []) {
+    upsertCandidate(candidate.url, candidate.hint);
   }
 
   return [...candidates.entries()]
@@ -414,6 +577,238 @@ function buildRankedUrls(parsed, normalizedText) {
     })
     .slice(0, MAX_RANKED_URLS)
     .map(([url]) => url);
+}
+
+function decodeHtmlEntities(value) {
+  return he.decode(String(value || ""));
+}
+
+function compactSplitCodeRuns(value) {
+  return String(value || "").replace(/\b(?:[A-Za-z0-9][\s-]+){3,7}[A-Za-z0-9]\b/g, (match) => {
+    const collapsed = match.replace(/[\s-]+/g, "");
+    if (!/\d/.test(collapsed)) return match;
+    if (/^\d{4,8}$/.test(collapsed)) return collapsed;
+    if (/^(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9]{6,8}$/.test(collapsed)) return collapsed;
+    return match;
+  });
+}
+
+function extractHtmlUrlCandidates($) {
+  const output = [];
+
+  $("a[href], area[href], form[action], button[formaction], input[formaction], [data-url], [data-href], [data-link]").each((_, element) => {
+    const node = $(element);
+    const hint = normalizeText([
+      decodeHtmlEntities(node.text()),
+      decodeHtmlEntities(node.attr("title")),
+      decodeHtmlEntities(node.attr("aria-label"))
+    ].filter(Boolean).join(" "));
+
+    for (const attribute of ["href", "action", "formaction", "data-url", "data-href", "data-link"]) {
+      const url = normalizeCandidateUrl(node.attr(attribute));
+      if (!url) continue;
+      output.push({ url, hint });
+    }
+  });
+
+  return output;
+}
+
+function normalizeCandidateUrl(value) {
+  let source = decodeHtmlEntities(value).trim();
+  if (!source) return "";
+
+  source = source.replace(/[\u0000-\u001F\s]+/g, "");
+  if (source.startsWith("//")) source = `https:${source}`;
+  if (/^www\./i.test(source)) source = `https://${source}`;
+  if (!/^https?:\/\//i.test(source)) return "";
+
+  const [normalized] = safeExtractUrls(source);
+  return normalized || source;
+}
+
+function preparePlainText(value) {
+  const source = normalizeText(decodeHtmlEntities(value));
+  if (!source) return "";
+  return normalizeText(compactSplitCodeRuns(stripQuotedReplyText(source)));
+}
+
+function safeHtmlToText(value) {
+  try {
+    return decodeHtmlEntities(htmlToText(value));
+  } catch (error) {
+    console.error("HTML to text conversion failed:", error);
+    return decodeHtmlEntities(String(value || "").replace(/<[^>]+>/g, " "));
+  }
+}
+
+function collectHiddenSignalTexts($) {
+  const output = [];
+
+  $("[hidden], [aria-hidden='true'], [style], [class], [id]").each((_, element) => {
+    if (!isHiddenSignalNode(element)) return;
+
+    const node = $(element);
+    const text = normalizeText(decodeHtmlEntities(node.text()));
+    if (shouldKeepHiddenSignalText(text)) output.push(text);
+    node.remove();
+  });
+
+  return output;
+}
+
+function removeHtmlNoise($) {
+  for (const selector of HTML_NOISE_SELECTORS) {
+    $(selector).remove();
+  }
+
+  $("[style]").each((_, element) => {
+    const styleValue = String(element.attribs?.style || "");
+    if (HIDDEN_STYLE_HINT.test(styleValue)) $(element).remove();
+  });
+
+  $("[class], [id]").each((_, element) => {
+    const hintValue = getHtmlNodeHintValue(element);
+    if (hintValue && HTML_NOISE_ATTR_HINTS.some((pattern) => pattern.test(hintValue))) {
+      $(element).remove();
+    }
+  });
+}
+
+function isHiddenSignalNode(element) {
+  if (!element?.attribs) return false;
+
+  const attrs = element.attribs;
+  const styleValue = String(attrs.style || "");
+  const hintValue = getHtmlNodeHintValue(element);
+
+  if (attrs.hidden !== undefined) return true;
+  if (String(attrs["aria-hidden"] || "").toLowerCase() === "true") return true;
+  if (styleValue && HIDDEN_STYLE_HINT.test(styleValue)) return true;
+  return hintValue ? HTML_PREHEADER_HINTS.some((pattern) => pattern.test(hintValue)) : false;
+}
+
+function getHtmlNodeHintValue(element) {
+  return [element?.attribs?.class, element?.attribs?.id, element?.attribs?.role, element?.attribs?.["aria-label"]]
+    .map((value) => String(value || "").trim().toLowerCase())
+    .filter(Boolean)
+    .join(" ");
+}
+
+function shouldKeepHiddenSignalText(value) {
+  const source = normalizeText(value);
+  if (!source) return false;
+  if (source.length > 280 && !containsOtpSignal(source)) return false;
+  if (containsOtpSignal(source)) return true;
+  if (/\b\d{4,8}\b/.test(source)) return true;
+  if (/\b[A-Z0-9]{6,8}\b/i.test(source)) return true;
+  return safeExtractUrls(source).length > 0;
+}
+
+function finalizeHiddenSignalText(value) {
+  const source = preparePlainText(value);
+  return shouldKeepHiddenSignalText(source) ? source : "";
+}
+
+function stripPhoneNumberNoise(value, senderContext = null) {
+  const source = normalizeText(String(value || ""));
+  if (!source) return "";
+
+  const matches = collectPhoneMatches(source, senderContext);
+  if (matches.length === 0) {
+    return normalizeText(source.replace(GENERIC_PHONE_NOISE_PATTERN, " "));
+  }
+
+  let output = "";
+  let cursor = 0;
+
+  for (const match of matches) {
+    const start = Number(match?.startsAt);
+    const end = Number(match?.endsAt);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start || end <= cursor) continue;
+
+    output += source.slice(cursor, start);
+    output += " ";
+    cursor = end;
+  }
+
+  output += source.slice(cursor);
+  return normalizeText(output.replace(GENERIC_PHONE_NOISE_PATTERN, " "));
+}
+
+function collectPhoneMatches(source, senderContext = null) {
+  const matches = new Map();
+
+  for (const defaultCountry of getPhoneDefaultCountries(source, senderContext)) {
+    try {
+      const found = defaultCountry ? findPhoneNumbersInText(source, defaultCountry) : findPhoneNumbersInText(source);
+      for (const item of found) {
+        const start = Number(item?.startsAt);
+        const end = Number(item?.endsAt);
+        if (!Number.isFinite(start) || !Number.isFinite(end) || end - start < 7) continue;
+        matches.set(`${start}:${end}`, { startsAt: start, endsAt: end });
+      }
+    } catch {}
+  }
+
+  return [...matches.values()].sort((left, right) => left.startsAt - right.startsAt);
+}
+
+function getPhoneDefaultCountries(source, senderContext = null) {
+  const values = [""];
+  const host = String(senderContext?.host || "").toLowerCase();
+  const tld = host.split(".").filter(Boolean).pop() || "";
+  const mappedCountry = DEFAULT_PHONE_COUNTRY_BY_TLD[tld];
+
+  if (mappedCountry) values.push(mappedCountry);
+  if (NANP_PHONE_HINT_PATTERN.test(source) && !values.includes("US")) values.push("US");
+
+  return values;
+}
+
+function stripQuotedReplyText(value) {
+  const source = normalizeText(value);
+  if (!source) return "";
+
+  const obviousReplyCut = stripObviousReplyContent(source);
+
+  try {
+    const parsedVisible = normalizeText(emailReplyParser.parseReply(source));
+    return chooseVisibleReplyText(obviousReplyCut, parsedVisible);
+  } catch {
+    return obviousReplyCut;
+  }
+}
+
+function chooseVisibleReplyText(fallbackValue, parsedValue) {
+  const fallbackText = normalizeText(fallbackValue);
+  const visibleText = normalizeText(parsedValue);
+
+  if (!visibleText) return fallbackText;
+  if (containsOtpSignal(visibleText)) return visibleText;
+  if (fallbackText && visibleText.length < Math.max(8, Math.floor(fallbackText.length * 0.1)) && containsOtpSignal(fallbackText)) {
+    return fallbackText;
+  }
+
+  return visibleText;
+}
+
+function stripObviousReplyContent(value) {
+  const source = String(value || "");
+  let cutIndex = -1;
+
+  for (const pattern of REPLY_SEPARATOR_PATTERNS) {
+    const match = pattern.exec(source);
+    if (!match || !Number.isFinite(match.index) || match.index <= 0) continue;
+    if (cutIndex === -1 || match.index < cutIndex) cutIndex = match.index;
+  }
+
+  return cutIndex === -1 ? source : source.slice(0, cutIndex).trim();
+}
+
+function containsOtpSignal(value) {
+  const source = String(value || "");
+  return OTP_SIGNAL_HINTS.some((pattern) => pattern.test(source));
 }
 
 function buildDebugBodyRecord({ messageId, parsed, extraction, createdAt, retentionDays }) {
@@ -474,11 +869,11 @@ function getEmailRetentionMs(env) {
 }
 
 function safeExtractUrls(value) {
-  const source = String(value || "").trim();
+  const source = decodeHtmlEntities(value).trim();
   if (!source) return [];
 
   try {
-    return [...getUrls(source)];
+    return [...getUrls(source, URL_EXTRACTION_OPTIONS)];
   } catch (error) {
     console.error("URL 提取失败:", error);
     return [];
@@ -499,7 +894,10 @@ function appendUniqueText(target, value) {
 }
 
 function normalizeText(value) {
-  return String(value || "")
+  const source = String(value || "");
+  const normalizedSource = typeof source.normalize === "function" ? source.normalize("NFKC") : source;
+
+  return normalizedSource
     .replace(/\r\n?/g, "\n")
     .replace(/[\u200B-\u200D\uFEFF]/g, "")
     .replace(/\u00A0/g, " ")
@@ -522,10 +920,11 @@ function getSenderContext(sender) {
   };
 }
 
-function scoreUrl(url, senderContext) {
+function scoreUrl(url, senderContext, hint = "") {
   let score = 0;
   let hostname = "";
   let domain = "";
+  const hintValue = normalizeText(decodeHtmlEntities(hint));
 
   try {
     const parsed = parseDomain(url);
@@ -536,6 +935,10 @@ function scoreUrl(url, senderContext) {
   if (/^https:\/\//i.test(url)) score += 10;
   if (URL_PRIORITY_HINTS.some((pattern) => pattern.test(url))) score += 25;
   if (URL_NOISE_HINTS.some((pattern) => pattern.test(url))) score -= 35;
+  if (hintValue && URL_PRIORITY_HINTS.some((pattern) => pattern.test(hintValue))) score += 18;
+  if (hintValue && URL_NOISE_HINTS.some((pattern) => pattern.test(hintValue))) score -= 12;
+  if (hintValue && containsOtpSignal(hintValue)) score += 24;
+  if (hintValue && MATCH_CONTEXT_EXTRA_NOISE_HINTS.some((pattern) => pattern.test(hintValue))) score -= 16;
 
   if (senderContext.host && hostname) {
     if (hostname === senderContext.host) score += 120;
@@ -635,10 +1038,19 @@ function scoreMatchValue(value, remark, matchIndex, content = "") {
 
   if (MATCH_REMARK_PRIORITY_HINTS.some((pattern) => pattern.test(remarkValue))) score += 45;
   const positiveDistance = findNearestPatternDistance(content, matchIndex, normalizedValue.length, MATCH_CONTEXT_PRIORITY_HINTS);
-  const noiseDistance = findNearestPatternDistance(content, matchIndex, normalizedValue.length, MATCH_CONTEXT_NOISE_HINTS);
+  const noiseDistance = findNearestPatternDistance(
+    content,
+    matchIndex,
+    normalizedValue.length,
+    [...MATCH_CONTEXT_NOISE_HINTS, ...MATCH_CONTEXT_EXTRA_NOISE_HINTS]
+  );
+  const urlDistance = /^https?:\/\//i.test(normalizedValue)
+    ? Number.POSITIVE_INFINITY
+    : findNearestPatternDistance(content, matchIndex, normalizedValue.length, [URL_RANGE_REGEX]);
 
   if (Number.isFinite(positiveDistance)) score += Math.max(0, 120 - positiveDistance * 5);
   if (Number.isFinite(noiseDistance)) score -= Math.max(0, 95 - noiseDistance * 4);
+  if (urlDistance === 0) score -= 180;
 
   if (Number.isFinite(matchIndex)) {
     score += Math.max(0, 24 - Math.floor(matchIndex / 48));

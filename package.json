@@ -9,8 +9,12 @@
     "build": "wrangler build"
   },
   "dependencies": {
+    "cheerio": "^1.2.0",
+    "email-reply-parser": "^2.3.5",
     "get-urls": "^12.1.0",
+    "he": "^1.2.0",
     "html-to-text": "^9.0.5",
+    "libphonenumber-js": "^1.12.40",
     "postal-mime": "^2.4.2",
     "tldts": "^7.0.25"
   },

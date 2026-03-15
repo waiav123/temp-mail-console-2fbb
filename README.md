@@ -18,18 +18,21 @@
 当前 Worker 的正文处理流程如下：
 
 1. 使用 `postal-mime` 解析邮件。
-2. 使用 `html-to-text` 将 HTML 转成可读文本。
-3. 归一化文本，去除多余空白与重复内容。
-4. 使用 `get-urls` 提取链接，再结合 `tldts` 做域名排序。
-5. 将提取输入统一改为：
+2. 使用 `cheerio` 预清洗 HTML，移除 `script/style/noscript`、引用块、常见 footer / tracking / hidden 节点。
+3. 使用 `html-to-text` 将清洗后的 HTML 转成可读文本。
+4. 使用 `he` 做 HTML entity 解码，并统一文本宽度与空白字符。
+5. 使用 `email-reply-parser` 剥离回复链、签名和明显引用正文。
+6. 使用 `libphonenumber-js` 识别支持电话类数字噪音，并在归一化文本中剔除。
+7. 使用 `get-urls` 提取链接，再结合 `tldts` 做域名归一、排序和 URL 候选补充。
+8. 将提取输入统一改为：
 
 ```text
 subject + normalized_text + ranked_urls
 ```
 
-6. 对规则执行全量匹配，不再只看单条规则的第一个命中。
-7. 如果规则使用了捕获组，优先返回第一个非空捕获组，而不是整段匹配文本。
-8. 按候选值类型、备注关键词、上下文距离、噪音词等因素排序，输出最优结果。
+9. 对规则执行全量匹配，不再只看单条规则的第一个命中。
+10. 如果规则使用了捕获组，优先返回第一个非空捕获组，而不是整段匹配文本。
+11. 按候选值类型、备注关键词、上下文距离、噪音词等因素排序，输出最优结果。
 
 ## 快速开始
 
@@ -73,6 +76,7 @@ npx wrangler d1 execute temp-email-db --file=schema.sql
 name = "temp-mail-console"
 main = "src/index.js"
 compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
 
 [[d1_databases]]
 binding = "DB"
@@ -94,6 +98,8 @@ crons = ["0 * * * *"]
 ```
 
 生产环境建议使用 `wrangler secret put` 设置敏感变量，不要直接写入仓库。
+
+说明：当前版本启用了 `email-reply-parser`，因此 Worker 需要开启 `nodejs_compat`。
 
 #### 5. 本地开发
 
@@ -224,9 +230,11 @@ GET /api/emails/latest?address=<email_address>
 - 6 位纯数字验证码优先级最高。
 - 4 到 8 位纯数字次之。
 - 6 到 8 位字母数字混合码次之。
+- 被拆成 `1 2 3 4 5 6` 或 `A-B-1-2-C-3` 的验证码会尽量先归并再匹配。
 - 备注中含有 `验证码`、`OTP`、`verification code` 等词会加分。
 - 候选值附近如果出现 `code`、`verify`、`验证码` 等词会显著加分。
 - 候选值附近如果更接近 `订单`、`金额`、`price`、`support` 等噪音词会减分。
+- 回复链、签名、页脚、支持电话等噪音会在正则匹配前尽量被剔除。
 
 ### 示例 1：通用 6 位验证码
 
